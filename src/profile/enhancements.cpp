@@ -8,6 +8,9 @@
 #include "shell/shell.hpp"
 #include "ui/layer.hpp"
 #endif
+#if defined(PURE_QUEST_VR)
+#include "gpu/xr_bridge.hpp"
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -283,6 +286,10 @@ void wrap_draw_sync(HleRegistrar &hle) {
     hle.bind("sceGe_user", kNidSceGeDrawSync, [](Runtime &rt, AllegrexContext &ctx) {
         auto &m = rt.memory();
         display_rate(&m);
+#if defined(PURE_QUEST_VR)
+        // The headset shows a race in stereo, the frontend on its screen (xr_bridge.hpp).
+        portablekit::gpu::xr::set_scene_3d(race_backend(m));
+#endif
         shield_step::frame(rt);  // task 107: the shield effect's override, once the race runs faster than the PSP
         if (settings::game_option("sixty_fps") == 1u) sixty_fps(m);
         if (settings::game_option("smooth_flashes") == 1u) smooth_flashes(m);

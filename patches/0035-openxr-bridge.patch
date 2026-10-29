@@ -1,5 +1,29 @@
+diff --git a/host/gpu/frame_interpolation.cpp b/host/gpu/frame_interpolation.cpp
+index 856c398..c6ccbd5 100644
+--- a/host/gpu/frame_interpolation.cpp
++++ b/host/gpu/frame_interpolation.cpp
+@@ -23,6 +23,7 @@ DrawSummary summarize(const DrawCall &call, float fit_x, float fit_y) {
+     draw.target = call.target.color_address;
+     draw.perspective = !call.through && !call.clear_mode && !is_orthographic(call.projection);
+     draw.transformed = !call.through && !call.clear_mode;
++    draw.clear = call.clear_mode;
+     // Vertex type bits 9..10 give the weight format; ge_state.cpp's
+     // decode_vertices skins exactly the transformed vertices that have one.
+     draw.skinned = ((call.vertex_type >> 9u) & 3u) != 0u && !call.through;
+diff --git a/host/gpu/frame_interpolation.hpp b/host/gpu/frame_interpolation.hpp
+index 905ac5b..89fd35c 100644
+--- a/host/gpu/frame_interpolation.hpp
++++ b/host/gpu/frame_interpolation.hpp
+@@ -45,6 +45,7 @@ struct DrawSummary {
+     // render-to-texture passes are shown as the frame drew them.
+     bool eligible{};
+     bool skinned{};  // the vertices were blended by bone matrices
++    bool clear{};    // a clear-mode draw (a headset's stereo view clears the whole eye with it)
+     Matrix world{};
+     Matrix view{};
+     Matrix projection{};
 diff --git a/host/gpu/vulkan_renderer.cpp b/host/gpu/vulkan_renderer.cpp
-index ef4fcb8..9f1b443 100644
+index ef4fcb8..fc91a08 100644
 --- a/host/gpu/vulkan_renderer.cpp
 +++ b/host/gpu/vulkan_renderer.cpp
 @@ -5,6 +5,7 @@
@@ -10,7 +34,22 @@ index ef4fcb8..9f1b443 100644
  #include "frame_pacing.hpp"
  #include "replacement_textures.hpp"
  #include "texture_decode.hpp"
-@@ -1874,6 +1875,11 @@ struct VulkanRenderer::Impl : host::SdlPad {
+@@ -1732,6 +1733,14 @@ struct VulkanRenderer::Impl : host::SdlPad {
+     bool poll_presents(std::chrono::steady_clock::time_point now, bool account, bool idle);
+     bool present_between(const pacing::PresentClock::Present &present, bool account);
+     void replay(VkCommandBuffer commands, std::uint32_t slot, float t);
++    // A headset's stereo view (xr_bridge.hpp): the frame drawn again for each eye.
++    std::array<Target, 2> eye_targets{};
++    bool stereo_ready{};  // newer_frame is the frame being presented, recorded for the eyes
++    std::uint64_t stereo_frames{};
++    [[nodiscard]] bool stereo_wanted() const;
++    void finish_stereo_frame(std::uint32_t displayed);
++    void record_stereo(VkCommandBuffer commands);
++    void replay_eye(VkCommandBuffer commands, Target &target, const xr::StereoFrame &stereo, std::uint32_t eye);
+     void report_interpolation();
+     void reset_interpolation();
+     void destroy_interpolation_targets();
+@@ -1874,6 +1883,11 @@ struct VulkanRenderer::Impl : host::SdlPad {
      bool recording{};
      bool quit{};
      bool ready{};
@@ -22,7 +61,7 @@ index ef4fcb8..9f1b443 100644
      std::uint64_t frames{};
      std::uint64_t draws{};
  
-@@ -1997,6 +2003,7 @@ struct VulkanRenderer::Impl : host::SdlPad {
+@@ -1997,6 +2011,7 @@ struct VulkanRenderer::Impl : host::SdlPad {
      }
      [[nodiscard]] VkPresentModeKHR wanted_present_mode() const;
      bool create_swapchain(std::string &error);
@@ -30,7 +69,7 @@ index ef4fcb8..9f1b443 100644
      void destroy_swapchain_views();
      void recreate_swapchain();
  #if defined(__ANDROID__)
-@@ -2029,6 +2036,7 @@ struct VulkanRenderer::Impl : host::SdlPad {
+@@ -2029,6 +2044,7 @@ struct VulkanRenderer::Impl : host::SdlPad {
      // frame. So the swapchain is rebuilt only when the display's transform or
      // the window's size really changed: once per turn of the phone.
      void check_swapchain() {
@@ -38,7 +77,7 @@ index ef4fcb8..9f1b443 100644
          if (!std::exchange(swapchain_check, false) || swapchain == VK_NULL_HANDLE) return;
  #if defined(__ANDROID__)
          VkSurfaceCapabilitiesKHR capabilities{};
-@@ -2337,6 +2345,21 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
+@@ -2337,6 +2353,21 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
          if (std::strcmp(extension.extensionName, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) == 0)
              portability_enumeration = true;
      if (portability_enumeration) extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
@@ -60,7 +99,7 @@ index ef4fcb8..9f1b443 100644
  
      VkApplicationInfo application{VK_STRUCTURE_TYPE_APPLICATION_INFO};
      application.pApplicationName = portablekit::game().app_name;
-@@ -2377,6 +2400,9 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
+@@ -2377,6 +2408,9 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
          }
      }
  
@@ -70,7 +109,7 @@ index ef4fcb8..9f1b443 100644
      std::uint32_t family_count = 0u;
      vkGetPhysicalDeviceQueueFamilyProperties(impl.physical_device, &family_count, nullptr);
      std::vector<VkQueueFamilyProperties> families(family_count);
-@@ -2411,14 +2437,20 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
+@@ -2411,14 +2445,20 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
              impl.breadcrumbs.available = true;
          }
      }
@@ -94,7 +133,7 @@ index ef4fcb8..9f1b443 100644
      // <prefix>_CHECK_GPU_DECODE: the check build of the raw vertex shader
      // writes what it decoded to a storage buffer.
      VkPhysicalDeviceFeatures supported_features{};
-@@ -2473,6 +2505,14 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
+@@ -2473,6 +2513,14 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
      if (!check(vkCreateDevice(impl.physical_device, &device_info, nullptr, &impl.device), "vkCreateDevice", error))
          return false;
      vkGetDeviceQueue(impl.device, impl.queue_family, 0u, &impl.queue);
@@ -109,7 +148,7 @@ index ef4fcb8..9f1b443 100644
      if (impl.breadcrumbs.available) {
          Impl::Breadcrumbs &b = impl.breadcrumbs;
          VkBufferCreateInfo marker_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-@@ -2520,6 +2560,7 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
+@@ -2520,6 +2568,7 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
          }
      }
      impl.swapchain_format = impl.surface_format.format;
@@ -117,7 +156,7 @@ index ef4fcb8..9f1b443 100644
      std::uint32_t mode_count = 0u;
      vkGetPhysicalDeviceSurfacePresentModesKHR(impl.physical_device, impl.surface, &mode_count, nullptr);
      impl.present_modes.resize(mode_count);
-@@ -3070,6 +3111,7 @@ void VulkanRenderer::Impl::update_display_info() {
+@@ -3070,6 +3119,7 @@ void VulkanRenderer::Impl::update_display_info() {
          if (const SDL_DisplayMode *mode = SDL_GetCurrentDisplayMode(display); mode != nullptr)
              refresh = mode->refresh_rate;
      }
@@ -125,7 +164,7 @@ index ef4fcb8..9f1b443 100644
      display_hz = refresh;
      perf::set_display_info(present_mode_name(present_mode), swapchain_extent.width, swapchain_extent.height, refresh);
  }
-@@ -3086,6 +3128,7 @@ VkPresentModeKHR VulkanRenderer::Impl::wanted_present_mode() const {
+@@ -3086,6 +3136,7 @@ VkPresentModeKHR VulkanRenderer::Impl::wanted_present_mode() const {
  
  // Builds the swapchain for the window's current size, replacing the old one.
  bool VulkanRenderer::Impl::create_swapchain(std::string &error) {
@@ -133,7 +172,7 @@ index ef4fcb8..9f1b443 100644
      VkSurfaceCapabilitiesKHR capabilities{};
      vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface, &capabilities);
      VkExtent2D extent = capabilities.currentExtent;
-@@ -3194,6 +3237,60 @@ bool VulkanRenderer::Impl::create_swapchain(std::string &error) {
+@@ -3194,6 +3245,60 @@ bool VulkanRenderer::Impl::create_swapchain(std::string &error) {
      return true;
  }
  
@@ -194,7 +233,7 @@ index ef4fcb8..9f1b443 100644
  void VulkanRenderer::Impl::destroy_swapchain_views() {
      for (VkFramebuffer framebuffer : ui_framebuffers) vkDestroyFramebuffer(device, framebuffer, nullptr);
      ui_framebuffers.clear();
-@@ -3226,6 +3323,7 @@ void VulkanRenderer::Impl::reset_surface() {
+@@ -3226,6 +3331,7 @@ void VulkanRenderer::Impl::reset_surface() {
  #endif
  
  void VulkanRenderer::Impl::recreate_swapchain() {
@@ -202,7 +241,7 @@ index ef4fcb8..9f1b443 100644
      // A minimised window has no area to present to; keep the old swapchain
      // and try again once it has one.
      int width = 0;
-@@ -3535,11 +3633,15 @@ void VulkanRenderer::Impl::record_game_blit(VkCommandBuffer commands, VkImage so
+@@ -3535,11 +3641,15 @@ void VulkanRenderer::Impl::record_game_blit(VkCommandBuffer commands, VkImage so
  void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence fence, VkImage source,
                                                VkExtent2D source_extent, bool game_frame, bool main_frame) {
  #if defined(__ANDROID__)
@@ -221,7 +260,7 @@ index ef4fcb8..9f1b443 100644
  #endif
      if (!acquired_image) {
          check_swapchain();
-@@ -3561,7 +3663,20 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
+@@ -3561,7 +3671,20 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
  
      std::uint32_t image_index = 0u;
      VkResult acquired = VK_ERROR_OUT_OF_DATE_KHR;
@@ -243,10 +282,12 @@ index ef4fcb8..9f1b443 100644
          image_index = *acquired_image;
          acquired = VK_SUCCESS;
          acquired_image.reset();
-@@ -3645,6 +3760,10 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
+@@ -3645,6 +3768,12 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
                  capture = true;
              }
          }
++        // The eyes' pictures first, when the frame is a 3D scene and the port's menu is closed.
++        if (xr && main_frame && game_frame && !draw_ui) record_stereo(commands);
 +        if (xr) {
 +            transition(commands, target, layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
 +            xr::bridge()->record_present(commands, target, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, swapchain_extent);
@@ -254,7 +295,7 @@ index ef4fcb8..9f1b443 100644
  #if defined(__ANDROID__)
          if (prerotated() && image_index < upright_images.size()) record_rotation(commands, image_index, layout);
          else
-@@ -3658,7 +3777,13 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
+@@ -3658,7 +3787,13 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
      VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
      submit.commandBufferCount = frame_batch(commands, batch);
      submit.pCommandBuffers = batch.data();
@@ -269,7 +310,7 @@ index ef4fcb8..9f1b443 100644
          submit.waitSemaphoreCount = 1u;
          submit.pWaitSemaphores = &acquire;
          submit.pWaitDstStageMask = &wait_stage;
-@@ -3670,7 +3795,8 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
+@@ -3670,7 +3805,8 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
      if (vkQueueSubmit(queue, 1u, &submit, fence) == VK_ERROR_DEVICE_LOST) device_lost("a frame's submit");
      perf::add_wait_time(perf::Clock::now() - submit_start, perf::Stall::Submit);
  
@@ -279,7 +320,16 @@ index ef4fcb8..9f1b443 100644
          VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
          present.waitSemaphoreCount = 1u;
          present.pWaitSemaphores = &render_finished[image_index];
-@@ -7719,6 +7845,7 @@ double VulkanRenderer::Impl::wanted_rate() const {
+@@ -5906,7 +6042,7 @@ void VulkanRenderer::begin_frame() {
+     }
+     // With frame interpolation each frame writes the next region and is
+     // recorded for drawing again; without it, the first region as before.
+-    impl.interpolating = impl.interpolation_wanted();
++    impl.interpolating = impl.interpolation_wanted() || impl.stereo_wanted();
+     const std::uint32_t region = impl.interpolating ? impl.next_region : impl.slot;
+     // A region another frame in flight, or a present between flips, may
+     // still draw from is waited for first (only when interpolation has just
+@@ -7719,6 +7855,7 @@ double VulkanRenderer::Impl::wanted_rate() const {
  }
  
  bool VulkanRenderer::Impl::interpolation_wanted() const {
@@ -287,12 +337,346 @@ index ef4fcb8..9f1b443 100644
      // Emulated time running ahead of real time already presents faster than
      // the game's own rate; the keyboard's held frame is shown as it is.
      return frame_rate != settings::FrameRate::Fps30 && !settings::current().unthrottled && !holding && !fast_forward &&
+@@ -8050,6 +8187,308 @@ bool VulkanRenderer::Impl::present_between(const pacing::PresentClock::Present &
+     return true;
+ }
+ 
++// Stereo for a headset (xr_bridge.hpp) ---------------------------------------
++//
++// While the game says its scene is 3D (xr::scene_3d), each frame is recorded
++// as frame interpolation records it, and at its present drawn again for each
++// eye into an eye image: the perspective draws into the displayed framebuffer
++// from the eye's pose and with the eye's field of view, clears over the whole
++// image, and everything else (the interface, 2D) flat on a rectangle a little
++// way in front of the eyes. The eye's projection keeps the game's clip z and w,
++// so depth comes out as the game wrote it; its clip x and y are the eye's.
++//
++// Test switches (env.txt on the Quest): PURE_VR_FLAT=1 (no stereo),
++// PURE_VR_UNITS_PER_METRE (the game's world units in a metre: the scale of the
++// eyes' distance and the head's movement), PURE_VR_HUD_DISTANCE and
++// PURE_VR_HUD_WIDTH (metres).
++
++namespace {
++
++using EyeMatrix = interpolation::Matrix;
++
++float vr_setting(const char *name, float fallback, float low, float high) {
++    const char *text = portablekit::env(name);
++    if (text == nullptr) return fallback;
++    char *end = nullptr;
++    const float value = std::strtof(text, &end);
++    return end != text && value >= low && value <= high ? value : fallback;
++}
++
++// From the reference space the eye's pose is given in to the eye's own: the
++// inverse of the pose, its position scaled from metres to the game's units.
++EyeMatrix eye_from_reference(const xr::EyeView &eye, float scale) {
++    const float x = eye.orientation[0], y = eye.orientation[1], z = eye.orientation[2], w = eye.orientation[3];
++    const float r00 = 1.0f - 2.0f * (y * y + z * z), r01 = 2.0f * (x * y - z * w), r02 = 2.0f * (x * z + y * w);
++    const float r10 = 2.0f * (x * y + z * w), r11 = 1.0f - 2.0f * (x * x + z * z), r12 = 2.0f * (y * z - x * w);
++    const float r20 = 2.0f * (x * z - y * w), r21 = 2.0f * (y * z + x * w), r22 = 1.0f - 2.0f * (x * x + y * y);
++    const float px = eye.position[0] * scale, py = eye.position[1] * scale, pz = eye.position[2] * scale;
++    EyeMatrix m{};  // column-major: the transposed rotation, and minus it times the position
++    m[0] = r00, m[4] = r10, m[8] = r20;
++    m[1] = r01, m[5] = r11, m[9] = r21;
++    m[2] = r02, m[6] = r12, m[10] = r22;
++    m[12] = -(r00 * px + r10 * py + r20 * pz);
++    m[13] = -(r01 * px + r11 * py + r21 * pz);
++    m[14] = -(r02 * px + r12 * py + r22 * pz);
++    m[15] = 1.0f;
++    return m;
++}
++
++// The game's eye axes against OpenXR's (x right, y up, -z forward), read off
++// the signs of its projection into clip space (x right, y down, w the depth),
++// and the scale of its w.
++struct EyeAxes {
++    float x{1.0f}, y{1.0f}, z{1.0f}, w_scale{1.0f};
++};
++
++EyeAxes eye_axes(const EyeMatrix &clip) {
++    EyeAxes axes;
++    axes.x = clip[0] < 0.0f ? -1.0f : 1.0f;
++    axes.y = clip[5] > 0.0f ? -1.0f : 1.0f;
++    axes.z = clip[11] > 0.0f ? -1.0f : 1.0f;
++    axes.w_scale = std::fabs(clip[11]);
++    return axes;
++}
++
++// The eye's projection, applied to the game's eye space: x and y from the
++// eye's field of view, z and w the game's own (`clip`: the draw's projection
++// with its viewport folded in).
++EyeMatrix eye_projection(const EyeMatrix &clip, const EyeAxes &axes, const xr::EyeView &eye) {
++    const float ax = 2.0f / (eye.tan_right - eye.tan_left);
++    const float bx = (eye.tan_right + eye.tan_left) / (eye.tan_right - eye.tan_left);
++    const float ay = 2.0f / (eye.tan_up - eye.tan_down);
++    const float by = (eye.tan_up + eye.tan_down) / (eye.tan_up - eye.tan_down);
++    const float k = axes.w_scale;
++    EyeMatrix p{};
++    p[0] = k * ax * axes.x;
++    p[8] = k * bx * axes.z;
++    p[5] = -k * ay * axes.y;
++    p[9] = -k * by * axes.z;
++    for (std::size_t column = 0; column < 4u; ++column) {
++        p[column * 4u + 2u] = clip[column * 4u + 2u];
++        p[column * 4u + 3u] = clip[column * 4u + 3u];
++    }
++    return p;
++}
++
++} // namespace
++
++bool VulkanRenderer::Impl::stereo_wanted() const {
++    if (!xr) return false;
++    static const bool flat = portablekit::env("VR_FLAT") != nullptr;
++    const VkExtent2D extent = xr::bridge()->stereo_extent();
++    return !flat && xr::scene_3d() && extent.width != 0u && extent.height != 0u;
++}
++
++// The frame the game just flipped becomes the one the eyes draw again.
++void VulkanRenderer::Impl::finish_stereo_frame(std::uint32_t displayed) {
++    FrameRecord &frame = recording_frame;
++    frame.recorded = frame.recorded && interpolating;
++    interpolation::mark_eligible(frame.summaries, displayed, false);
++    frame.displayed = displayed;
++    frame.valid = true;
++    std::swap(newer_frame, recording_frame);
++    recording_frame.clear();
++    next_region = (frame_region + 1u) % kFrameRegions;
++    stereo_ready = newer_frame.recorded;
++}
++
++// In the frame's own command buffer, outside a render pass: the two eye
++// images, handed to the headset.
++void VulkanRenderer::Impl::record_stereo(VkCommandBuffer commands) {
++    if (!stereo_ready || !newer_frame.valid || !newer_frame.recorded) return;
++    stereo_ready = false;
++    const VkExtent2D extent = xr::bridge()->stereo_extent();
++    if (extent.width == 0u || extent.height == 0u) return;
++    for (Target &target : eye_targets) {
++        if (target.color != VK_NULL_HANDLE) continue;
++        target = Target{};
++        target.extent = extent;
++        std::string error;
++        if (!create_target(target, error)) {
++            std::cout << "[vr] no room for the eye images: " << error << "\n";
++            destroy_target(target);
++            return;
++        }
++    }
++    xr::StereoFrame stereo{};
++    if (!xr::bridge()->stereo_begin(stereo)) return;
++    std::array<VkImage, 2> images{};
++    for (std::uint32_t eye = 0; eye < 2u; ++eye) {
++        replay_eye(commands, eye_targets[eye], stereo, eye);
++        transition(commands, eye_targets[eye].color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
++                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++        images[eye] = eye_targets[eye].color;
++    }
++    xr::bridge()->record_stereo(commands, images, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, extent);
++    for (const Target &target : eye_targets)
++        transition(commands, target.color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                   VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++}
++
++void VulkanRenderer::Impl::replay_eye(VkCommandBuffer commands, Target &target, const xr::StereoFrame &stereo,
++                                      std::uint32_t eye) {
++    const perf::SplitScope split(perf::Split::Replay);
++    const FrameRecord &frame = newer_frame;
++    const xr::EyeView &view = stereo.eyes[eye];
++    breadcrumb(commands, "an eye of the stereo view, " + std::to_string(frame.groups.size()) + " draw calls");
++    initialize_layouts(commands, target);
++    VkRenderPassBeginInfo pass{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
++    pass.renderPass = render_pass;
++    pass.framebuffer = target.framebuffer;
++    pass.renderArea = {{0, 0}, target.extent};
++    vkCmdBeginRenderPass(commands, &pass, VK_SUBPASS_CONTENTS_INLINE);
++    perf::count_render_pass();
++    vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 2u, 1u,
++                            &target.input_descriptor, 0u, nullptr);
++    std::array<VkClearAttachment, 2> clears{};
++    clears[0].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    clears[0].colorAttachment = 0u;
++    clears[0].clearValue.color = {{0.0f, 0.0f, 0.0f, 1.0f}};
++    clears[1].aspectMask = depth_aspect();
++    clears[1].clearValue.depthStencil = {0.0f, 0u};
++    const VkClearRect whole_rect{{{0, 0}, target.extent}, 0u, 1u};
++    vkCmdClearAttachments(commands, static_cast<std::uint32_t>(clears.size()), clears.data(), 1u, &whole_rect);
++
++    static const float scale = vr_setting("VR_UNITS_PER_METRE", 1.0f, 0.001f, 100000.0f);
++    static const float hud_distance = vr_setting("VR_HUD_DISTANCE", 2.0f, 0.3f, 50.0f);
++    static const float hud_width = vr_setting("VR_HUD_WIDTH", 1.8f, 0.1f, 50.0f);
++    const EyeMatrix from_reference = eye_from_reference(view, scale);
++    const float width = static_cast<float>(target.extent.width);
++    const float height = static_cast<float>(target.extent.height);
++
++    // The interface's rectangle: a plane hud_distance ahead of the head,
++    // centred between the eyes, hud_width wide, as tall as the PSP's screen.
++    const xr::EyeView &other = stereo.eyes[eye ^ 1u];
++    const float dx = view.position[0] - other.position[0];
++    const float dy = view.position[1] - other.position[1];
++    const float dz = view.position[2] - other.position[2];
++    const float half_ipd = 0.5f * std::sqrt(dx * dx + dy * dy + dz * dz);
++    const float eye_x = eye == 0u ? -half_ipd : half_ipd;
++    const auto pixel_x = [&](float metres) {
++        const float ndc = (2.0f * metres / hud_distance - (view.tan_right + view.tan_left)) /
++                          (view.tan_right - view.tan_left);
++        return (ndc + 1.0f) * 0.5f * width;
++    };
++    const auto pixel_y = [&](float metres) {
++        const float ndc = (2.0f * metres / hud_distance - (view.tan_up + view.tan_down)) / (view.tan_up - view.tan_down);
++        return (1.0f - ndc) * 0.5f * height;
++    };
++    const float half_width = 0.5f * hud_width;
++    const float half_height = half_width * static_cast<float>(kPspHeight) / static_cast<float>(kPspWidth);
++    const float hud_left = pixel_x(-half_width - eye_x), hud_right = pixel_x(half_width - eye_x);
++    const float hud_top = pixel_y(half_height), hud_bottom = pixel_y(-half_height);
++    VkExtent2D source = target_extent;
++    if (const auto shown = targets.find(frame.displayed); shown != targets.end()) source = shown->second.extent;
++    const float scissor_x = (hud_right - hud_left) / static_cast<float>(std::max(1u, source.width));
++    const float scissor_y = (hud_bottom - hud_top) / static_cast<float>(std::max(1u, source.height));
++    const VkRect2D all{{0, 0}, target.extent};
++
++    DrawState set{};
++    bool known = false;
++    EyeMatrix last_view{}, last_world{}, last_clip{}, eye_space{}, transform{};
++    bool cached = false;
++    std::uint32_t perspective = 0u, flat = 0u;
++    float nearest = 0.0f;
++    for (const ReplayGroup &drawn : frame.groups) {
++        if (drawn.target != frame.displayed) continue;
++        DrawState state = drawn.state;
++        const interpolation::DrawSummary &summary = frame.summaries[drawn.first_draw];
++        const float min_depth = drawn.state.viewport.minDepth, max_depth = drawn.state.viewport.maxDepth;
++        if (summary.eligible) {
++            if (!cached || summary.view != last_view || summary.world != last_world ||
++                summary.projection != last_clip) {
++                const EyeAxes axes = eye_axes(summary.projection);
++                const EyeMatrix flip{axes.x, 0.0f, 0.0f, 0.0f, 0.0f, axes.y, 0.0f, 0.0f,
++                                     0.0f, 0.0f, axes.z, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f};
++                eye_space = interpolation::multiply(
++                    flip, interpolation::multiply(
++                              from_reference, interpolation::multiply(
++                                                  flip, interpolation::multiply(summary.view, summary.world))));
++                transform = interpolation::multiply(eye_projection(summary.projection, axes, view), eye_space);
++                last_view = summary.view;
++                last_world = summary.world;
++                last_clip = summary.projection;
++                cached = true;
++            }
++            state.push.transform = transform;
++            state.push.view_z = {eye_space[2], eye_space[6], eye_space[10], eye_space[14]};
++            state.viewport = {0.0f, 0.0f, width, height, min_depth, max_depth};
++            state.scissor = all;
++            ++perspective;
++            const auto &t = summary.eye_translation;
++            const float distance = std::sqrt(t[0] * t[0] + t[1] * t[1] + t[2] * t[2]);
++            if (nearest == 0.0f || distance < nearest) nearest = distance;
++        } else if (summary.clear) {
++            state.viewport = {0.0f, 0.0f, width, height, min_depth, max_depth};
++            state.scissor = all;
++        } else {
++            state.viewport = {hud_left, hud_top, hud_right - hud_left, hud_bottom - hud_top, min_depth, max_depth};
++            const float x0 = std::clamp(hud_left + static_cast<float>(drawn.state.scissor.offset.x) * scissor_x, 0.0f, width);
++            const float y0 = std::clamp(hud_top + static_cast<float>(drawn.state.scissor.offset.y) * scissor_y, 0.0f, height);
++            const float x1 = std::clamp(hud_left + static_cast<float>(drawn.state.scissor.offset.x +
++                                                                      static_cast<std::int32_t>(drawn.state.scissor.extent.width)) *
++                                                       scissor_x,
++                                        0.0f, width);
++            const float y1 = std::clamp(hud_top + static_cast<float>(drawn.state.scissor.offset.y +
++                                                                     static_cast<std::int32_t>(drawn.state.scissor.extent.height)) *
++                                                      scissor_y,
++                                        0.0f, height);
++            state.scissor = {{static_cast<std::int32_t>(x0), static_cast<std::int32_t>(y0)},
++                             {static_cast<std::uint32_t>(std::max(0.0f, x1 - x0)),
++                              static_cast<std::uint32_t>(std::max(0.0f, y1 - y0))}};
++            ++flat;
++        }
++
++        if (!known || std::memcmp(&state.viewport, &set.viewport, sizeof(VkViewport)) != 0)
++            vkCmdSetViewport(commands, 0u, 1u, &state.viewport);
++        if (!known || state.blend != set.blend) vkCmdSetBlendConstants(commands, state.blend.data());
++        if (!known || std::memcmp(&state.scissor, &set.scissor, sizeof(VkRect2D)) != 0)
++            vkCmdSetScissor(commands, 0u, 1u, &state.scissor);
++        if (!known || state.pipeline != set.pipeline)
++            vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, state.pipeline);
++        if (!known || state.texture != set.texture)
++            vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0u, 1u,
++                                    &state.texture, 0u, nullptr);
++        if (!known || state.lighting != set.lighting)
++            vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 1u, 1u,
++                                    &lighting_descriptor, static_cast<std::uint32_t>(state.lighting.size()),
++                                    state.lighting.data());
++        if (!known || std::memcmp(&state.push, &set.push, sizeof(PushConstants)) != 0)
++            vkCmdPushConstants(commands, pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
++                               0u, sizeof(PushConstants), &state.push);
++        set = state;
++        known = true;
++        const VkDeviceSize vertex_base = drawn.vertex_base;
++        vkCmdBindVertexBuffers(commands, 0u, 1u, &vertex_buffer, &vertex_base);
++        if (drawn.index_buffer != VK_NULL_HANDLE) {
++            vkCmdBindIndexBuffer(commands, drawn.index_buffer, drawn.index_base, VK_INDEX_TYPE_UINT16);
++            vkCmdDrawIndexed(commands, drawn.count, 1u, 0u, 0, drawn.raw ? static_cast<std::uint32_t>(vertex_base) : 0u);
++        } else {
++            vkCmdDraw(commands, drawn.count, 1u, 0u, 0u);
++        }
++    }
++    vkCmdEndRenderPass(commands);
++
++    // Every five seconds or so: what the eyes drew, and the numbers that say
++    // whether the game's eye space was read right and how big its units are.
++    if (eye == 0u && stereo_frames++ % 360u == 0u) {
++        std::printf("[vr] stereo: %u 3D and %u flat draw calls, eye %ux%u, nearest 3D object %.2f units away, "
++                    "%.3g units a metre, interface %.0f..%.0f x %.0f..%.0f\n",
++                    perspective, flat, target.extent.width, target.extent.height, static_cast<double>(nearest),
++                    static_cast<double>(scale), static_cast<double>(hud_left), static_cast<double>(hud_right),
++                    static_cast<double>(hud_top), static_cast<double>(hud_bottom));
++        for (const interpolation::DrawSummary &summary : frame.summaries) {
++            if (!summary.eligible) continue;
++            const EyeMatrix &c = summary.projection;
++            std::printf("[vr] the game's projection: x %.3f y %.3f z %.4f %.4f w %.3f %.3f\n",
++                        static_cast<double>(c[0]), static_cast<double>(c[5]), static_cast<double>(c[10]),
++                        static_cast<double>(c[14]), static_cast<double>(c[11]), static_cast<double>(c[15]));
++            break;
++        }
++        std::fflush(stdout);
++    }
++}
++
+ // Draws the older frame into the slot's blend target with every matched
+ // draw's transforms blended a fraction `t` towards the newer frame's. Draws
+ // without a partner in the newer frame, and those never blended (2D, the
+@@ -8464,6 +8903,7 @@ void VulkanRenderer::Impl::reset_interpolation() {
+ void VulkanRenderer::Impl::destroy_interpolation_targets() {
+     for (Target &picture : pictures) destroy_target(picture);
+     for (Target &target : blend_targets) destroy_target(target);
++    for (Target &target : eye_targets) destroy_target(target);
+     older_picture_valid = newer_picture_valid = false;
+ }
+ 
+@@ -8646,8 +9086,14 @@ bool VulkanRenderer::present(std::uint32_t display_address,
+         impl.poll_presents(std::chrono::steady_clock::now(), false, false);
+         return false;
+     }
+-    // The game's frame as it is, at its flip.
+-    if (impl.cycle_active || impl.newer_frame.valid) impl.reset_interpolation();
++    if (impl.xr) {
++        // A headset's stereo view draws the frame the game just flipped again (xr_bridge.hpp).
++        if (impl.interpolating && source != VK_NULL_HANDLE) impl.finish_stereo_frame(impl.presented_target);
++        else if (impl.newer_frame.valid) impl.reset_interpolation();
++    } else if (impl.cycle_active || impl.newer_frame.valid) {
++        // The game's frame as it is, at its flip.
++        impl.reset_interpolation();
++    }
+     if (impl.fast_forward) {
+         // A load running fast: the flip is drawn, and shown only when the
+         // window has not had a picture for a while, so the display's refresh
 diff --git a/host/gpu/xr_bridge.hpp b/host/gpu/xr_bridge.hpp
 new file mode 100644
-index 0000000..e699659
+index 0000000..d3b9d76
 --- /dev/null
 +++ b/host/gpu/xr_bridge.hpp
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,128 @@
 +#pragma once
 +
 +// An OpenXR runtime that the Vulkan renderer presents into instead of its
@@ -324,10 +708,24 @@ index 0000000..e699659
 +#include <vulkan/vulkan.h>
 +
 +#include <array>
++#include <atomic>
 +#include <cstdint>
 +#include <vector>
 +
 +namespace portablekit::gpu::xr {
++
++// One eye of a stereo frame, as the runtime located it: its pose in the
++// reference space (metres; x right, y up, -z forward) and the tangents of its
++// field of view's edges (left and down negative).
++struct EyeView {
++    std::array<float, 3> position{};
++    std::array<float, 4> orientation{0.0f, 0.0f, 0.0f, 1.0f};  // x, y, z, w
++    float tan_left{-1.0f}, tan_right{1.0f}, tan_up{1.0f}, tan_down{-1.0f};
++};
++struct StereoFrame {
++    VkExtent2D extent{};
++    std::array<EyeView, 2> eyes{};  // left, right
++};
 +
 +class Bridge {
 +public:
@@ -366,7 +764,31 @@ index 0000000..e699659
 +    // (shell/gamepad.hpp): read by the pad on every poll.
 +    [[nodiscard]] virtual bool button(int button) const = 0;
 +    [[nodiscard]] virtual float axis(int axis) const = 0;
++
++    // Stereo: while the game says its scene is 3D (set_scene_3d), the
++    // renderer draws the frame's 3D draws again for each eye, from the eye's
++    // pose and field of view, into two images of stereo_extent() (0 by 0: no
++    // stereo). In a present, after begin_frame() said yes: stereo_begin()
++    // (false: not now), then record_stereo() copies the two images into the
++    // runtime's eye swapchains, recorded in the same command buffer; the
++    // headset then shows them instead of the screen. A present without them
++    // shows the screen again.
++    [[nodiscard]] virtual VkExtent2D stereo_extent() const { return {0u, 0u}; }
++    virtual bool stereo_begin(StereoFrame &frame) { return (void)frame, false; }
++    virtual void record_stereo(VkCommandBuffer commands, const std::array<VkImage, 2> &images, VkImageLayout layout,
++                               VkExtent2D extent) {
++        (void)commands, (void)images, (void)layout, (void)extent;
++    }
 +};
++
++// Set by the game once a frame: whether its picture is a 3D scene worth
++// showing in stereo (a race), rather than menus.
++inline std::atomic<bool> &scene_3d_slot() noexcept {
++    static std::atomic<bool> slot{false};
++    return slot;
++}
++inline void set_scene_3d(bool scene) noexcept { scene_3d_slot().store(scene, std::memory_order_relaxed); }
++[[nodiscard]] inline bool scene_3d() noexcept { return scene_3d_slot().load(std::memory_order_relaxed); }
 +
 +inline Bridge *&bridge_slot() noexcept {
 +    static Bridge *slot = nullptr;

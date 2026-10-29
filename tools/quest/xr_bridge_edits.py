@@ -375,4 +375,55 @@ edit(A, "} // namespace\n\nint main(int argc, char *argv[]) {\n    redirect_outp
      "    use_external_storage();\n"
      "#endif\n")
 
+
+# --- Stereo (xr_bridge.hpp: stereo_begin / record_stereo) ---------------------
+FI_H = "host/gpu/frame_interpolation.hpp"
+FI_C = "host/gpu/frame_interpolation.cpp"
+edit(FI_H, "    bool skinned{};  // the vertices were blended by bone matrices\n",
+     "    bool skinned{};  // the vertices were blended by bone matrices\n"
+     "    bool clear{};    // a clear-mode draw (a headset's stereo view clears the whole eye with it)\n")
+edit(FI_C, "    draw.transformed = !call.through && !call.clear_mode;\n",
+     "    draw.transformed = !call.through && !call.clear_mode;\n"
+     "    draw.clear = call.clear_mode;\n")
+
+edit(R, "    void replay(VkCommandBuffer commands, std::uint32_t slot, float t);\n",
+     "    void replay(VkCommandBuffer commands, std::uint32_t slot, float t);\n"
+     "    // A headset's stereo view (xr_bridge.hpp): the frame drawn again for each eye.\n"
+     "    std::array<Target, 2> eye_targets{};\n"
+     "    bool stereo_ready{};  // newer_frame is the frame being presented, recorded for the eyes\n"
+     "    std::uint64_t stereo_frames{};\n"
+     "    [[nodiscard]] bool stereo_wanted() const;\n"
+     "    void finish_stereo_frame(std::uint32_t displayed);\n"
+     "    void record_stereo(VkCommandBuffer commands);\n"
+     "    void replay_eye(VkCommandBuffer commands, Target &target, const xr::StereoFrame &stereo, std::uint32_t eye);\n")
+
+stereo_code = pathlib.Path(__file__).with_name("stereo_replay.inc").read_text()
+anchor = "// Draws the older frame into the slot's blend target with every matched\n"
+edit(R, anchor, stereo_code + anchor)
+
+edit(R, "    impl.interpolating = impl.interpolation_wanted();\n",
+     "    impl.interpolating = impl.interpolation_wanted() || impl.stereo_wanted();\n")
+
+edit(R, "    // The game's frame as it is, at its flip.\n"
+        "    if (impl.cycle_active || impl.newer_frame.valid) impl.reset_interpolation();\n",
+     "    if (impl.xr) {\n"
+     "        // A headset's stereo view draws the frame the game just flipped again (xr_bridge.hpp).\n"
+     "        if (impl.interpolating && source != VK_NULL_HANDLE) impl.finish_stereo_frame(impl.presented_target);\n"
+     "        else if (impl.newer_frame.valid) impl.reset_interpolation();\n"
+     "    } else if (impl.cycle_active || impl.newer_frame.valid) {\n"
+     "        // The game's frame as it is, at its flip.\n"
+     "        impl.reset_interpolation();\n"
+     "    }\n")
+
+edit(R, "        if (xr) {\n            transition(commands, target, layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);\n",
+     "        // The eyes' pictures first, when the frame is a 3D scene and the port's menu is closed.\n"
+     "        if (xr && main_frame && game_frame && !draw_ui) record_stereo(commands);\n"
+     "        if (xr) {\n            transition(commands, target, layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);\n")
+
+edit(R, "    for (Target &target : blend_targets) destroy_target(target);\n"
+        "    older_picture_valid = newer_picture_valid = false;\n",
+     "    for (Target &target : blend_targets) destroy_target(target);\n"
+     "    for (Target &target : eye_targets) destroy_target(target);\n"
+     "    older_picture_valid = newer_picture_valid = false;\n")
+
 print("changed:", sorted(set(changed)) or "nothing (already applied)")

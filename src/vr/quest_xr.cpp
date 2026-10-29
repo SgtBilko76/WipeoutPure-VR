@@ -55,6 +55,7 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -133,9 +134,13 @@ public:
     bool begin_frame() override;
     void record_present(VkCommandBuffer commands, VkImage image, VkImageLayout layout, VkExtent2D extent) override;
     [[nodiscard]] VkSemaphore frame_semaphore() override {
-        return acquired_ ? semaphores_[next_semaphore_] : VK_NULL_HANDLE;
+        return acquired_ || stereo_acquired_ ? semaphores_[next_semaphore_] : VK_NULL_HANDLE;
     }
     void end_frame() override;
+    [[nodiscard]] VkExtent2D stereo_extent() const override { return eye_extent_; }
+    bool stereo_begin(portablekit::gpu::xr::StereoFrame &frame) override;
+    void record_stereo(VkCommandBuffer commands, const std::array<VkImage, 2> &images, VkImageLayout layout,
+                       VkExtent2D extent) override;
     [[nodiscard]] bool button(int button) const override {
         return button >= 0 && button < 32 && (buttons_.load(std::memory_order_relaxed) & (1u << button)) != 0u;
     }
@@ -150,6 +155,9 @@ private:
         return std::find(available_.begin(), available_.end(), name) != available_.end();
     }
     void frame_loop();
+    void record_copy(VkCommandBuffer commands, VkImage source, VkImageLayout layout, VkImage target,
+                     VkExtent2D extent) const;
+    bool create_eye_swapchains();
     void poll_events();
     bool create_actions();
     void read_input();
@@ -201,6 +209,23 @@ private:
 
     // The renderer's frame.
     bool acquired_{};
+    bool stereo_acquired_{};
+    std::array<XrPosef, 2> eye_pose_{};
+    std::array<XrFovf, 2> eye_fov_{};
+    std::array<VkImage, 2> eye_target_{};
+
+    // The eyes' swapchains (stereo while the game shows a race).
+    std::array<XrSwapchain, 2> eye_swapchains_{XR_NULL_HANDLE, XR_NULL_HANDLE};
+    std::array<std::vector<XrSwapchainImageVulkanKHR>, 2> eye_images_;
+    VkExtent2D eye_extent_{};
+    std::atomic<bool> stereo_ready_{};  // both eye swapchains have had an image released
+    // What the frame thread shows: written by end_frame() under xr_mutex_.
+    bool shown_stereo_{};
+    std::array<XrPosef, 2> shown_pose_{};
+    std::array<XrFovf, 2> shown_fov_{};
+    // The display time of the headset's next frame, for locating the eyes.
+    std::atomic<XrTime> next_display_time_{0};
+    std::uint64_t stereo_presents_{};
 
     XrActionSet actions_{XR_NULL_HANDLE};
     XrAction a_{}, b_{}, x_{}, y_{}, menu_{}, left_click_{}, right_click_{};
@@ -390,8 +415,57 @@ bool QuestXr::start(VkInstance instance, VkPhysicalDevice physical_device, VkDev
         if (XR_SUCCEEDED(get_refresh_rate_(session_, &rate)) && rate > 0.0f) refresh_.store(rate);
     }
     log("display refresh %.0f Hz", static_cast<double>(refresh_.load()));
+    if (!create_eye_swapchains()) {
+        eye_extent_ = {};
+        log("no stereo: the race stays on the screen");
+    }
     if (!create_actions()) return false;
     thread_ = std::thread([this] { frame_loop(); });
+    return true;
+}
+
+// Two swapchains at the runtime's recommended eye size, scaled by
+// PURE_VR_EYE_SCALE (default 0.8: the PSP's art gains little from more).
+bool QuestXr::create_eye_swapchains() {
+    std::uint32_t count = 0;
+    if (!ok(xrEnumerateViewConfigurationViews(instance_, system_, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0,
+                                              &count, nullptr),
+            "xrEnumerateViewConfigurationViews") ||
+        count != 2u)
+        return false;
+    std::array<XrViewConfigurationView, 2> views{};
+    for (XrViewConfigurationView &view : views) view.type = XR_TYPE_VIEW_CONFIGURATION_VIEW;
+    xrEnumerateViewConfigurationViews(instance_, system_, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, count, &count,
+                                      views.data());
+    float scale = 0.8f;
+    if (const char *text = std::getenv("PURE_VR_EYE_SCALE"); text != nullptr) {
+        const float named = std::strtof(text, nullptr);
+        if (named >= 0.3f && named <= 1.5f) scale = named;
+    }
+    const auto size = [scale](std::uint32_t recommended, std::uint32_t most) {
+        const auto scaled = static_cast<std::uint32_t>(static_cast<float>(recommended) * scale) & ~7u;
+        return std::clamp<std::uint32_t>(scaled, 256u, most);
+    };
+    eye_extent_ = {size(views[0].recommendedImageRectWidth, views[0].maxImageRectWidth),
+                   size(views[0].recommendedImageRectHeight, views[0].maxImageRectHeight)};
+    for (std::size_t eye = 0; eye < 2u; ++eye) {
+        XrSwapchainCreateInfo create{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+        create.usageFlags = XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+        create.format = swapchain_format_;
+        create.sampleCount = 1;
+        create.width = eye_extent_.width;
+        create.height = eye_extent_.height;
+        create.faceCount = 1;
+        create.arraySize = 1;
+        create.mipCount = 1;
+        if (!ok(xrCreateSwapchain(session_, &create, &eye_swapchains_[eye]), "xrCreateSwapchain (eye)")) return false;
+        xrEnumerateSwapchainImages(eye_swapchains_[eye], 0, &count, nullptr);
+        eye_images_[eye].assign(count, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+        xrEnumerateSwapchainImages(eye_swapchains_[eye], count, &count,
+                                   reinterpret_cast<XrSwapchainImageBaseHeader *>(eye_images_[eye].data()));
+    }
+    log("eye swapchains %ux%u (recommended %ux%u, scale %.2f)", eye_extent_.width, eye_extent_.height,
+        views[0].recommendedImageRectWidth, views[0].recommendedImageRectHeight, static_cast<double>(scale));
     return true;
 }
 
@@ -601,14 +675,35 @@ void QuestXr::frame_loop() {
             continue;
         }
         read_input();
+        // The renderer's next eye images are shown from the headset's next frame on.
+        next_display_time_.store(frame.predictedDisplayTime + frame.predictedDisplayPeriod);
         std::lock_guard lock(xr_mutex_);
         XrFrameBeginInfo begin{XR_TYPE_FRAME_BEGIN_INFO};
         if (!ok(xrBeginFrame(session_, &begin), "xrBeginFrame")) continue;
         XrCompositionLayerCylinderKHR cylinder{XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR};
         XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
+        XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+        std::array<XrCompositionLayerProjectionView, 2> eye_views{};
         const XrCompositionLayerBaseHeader *layers[1]{};
         std::uint32_t layer_count = 0;
-        if (frame.shouldRender == XR_TRUE && has_image_.load()) {
+        if (frame.shouldRender == XR_TRUE && shown_stereo_ && stereo_ready_.load()) {
+            // The race in stereo: the eye images, with the poses they were drawn from (the
+            // compositor turns them to where the head is now).
+            for (std::size_t eye = 0; eye < 2u; ++eye) {
+                eye_views[eye] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
+                eye_views[eye].pose = shown_pose_[eye];
+                eye_views[eye].fov = shown_fov_[eye];
+                eye_views[eye].subImage = {eye_swapchains_[eye],
+                                           {{0, 0},
+                                            {static_cast<std::int32_t>(eye_extent_.width),
+                                             static_cast<std::int32_t>(eye_extent_.height)}},
+                                           0};
+            }
+            projection.space = local_;
+            projection.viewCount = 2;
+            projection.views = eye_views.data();
+            layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&projection);
+        } else if (frame.shouldRender == XR_TRUE && has_image_.load()) {
             const XrSwapchainSubImage sub{swapchain_, {{0, 0}, {static_cast<std::int32_t>(kPanelWidth),
                                                                 static_cast<std::int32_t>(kPanelHeight)}}, 0};
             const float aspect = static_cast<float>(kPanelWidth) / static_cast<float>(kPanelHeight);
@@ -655,7 +750,44 @@ void QuestXr::frame_loop() {
 // The renderer's side. Never blocks for the headset.
 bool QuestXr::begin_frame() {
     acquired_ = false;
+    stereo_acquired_ = false;
     return running_.load() && visible_.load();
+}
+
+// Records the copy of `source` (in `layout`) into a swapchain image, leaving
+// that in COLOR_ATTACHMENT_OPTIMAL as the runtime expects it.
+void QuestXr::record_copy(VkCommandBuffer commands, VkImage source, VkImageLayout layout, VkImage target,
+                          VkExtent2D extent) const {
+    VkImageMemoryBarrier barriers[2]{};
+    barriers[0] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barriers[0].oldLayout = layout;
+    barriers[0].newLayout = layout;
+    barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[0].image = source;
+    barriers[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u};
+    barriers[1] = barriers[0];
+    barriers[1].srcAccessMask = 0u;
+    barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barriers[1].image = target;
+    vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0u, 0u, nullptr, 0u, nullptr, 2u, barriers);
+    VkImageCopy copy{};
+    copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u};
+    copy.dstSubresource = copy.srcSubresource;
+    copy.extent = {extent.width, extent.height, 1u};
+    vkCmdCopyImage(commands, source, layout, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1u, &copy);
+    VkImageMemoryBarrier done = barriers[1];
+    done.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    done.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    done.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    done.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0u,
+                         0u, nullptr, 0u, nullptr, 1u, &done);
 }
 
 void QuestXr::record_present(VkCommandBuffer commands, VkImage image, VkImageLayout layout, VkExtent2D extent) {
@@ -677,48 +809,103 @@ void QuestXr::record_present(VkCommandBuffer commands, VkImage image, VkImageLay
         return;
     }
     acquired_ = true;
-    VkImage target = images_[index].image;
+    record_copy(commands, image, layout, images_[index].image,
+                {std::min(extent.width, kPanelWidth), std::min(extent.height, kPanelHeight)});
+}
 
-    VkImageMemoryBarrier barriers[2]{};
-    barriers[0] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    barriers[0].oldLayout = layout;
-    barriers[0].newLayout = layout;
-    barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barriers[0].image = image;
-    barriers[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u};
-    barriers[1] = barriers[0];
-    barriers[1].srcAccessMask = 0u;
-    barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    barriers[1].image = target;
-    vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0u, 0u, nullptr, 0u, nullptr, 2u, barriers);
-    VkImageCopy copy{};
-    copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u};
-    copy.dstSubresource = copy.srcSubresource;
-    copy.extent = {std::min(extent.width, kPanelWidth), std::min(extent.height, kPanelHeight), 1u};
-    vkCmdCopyImage(commands, image, layout, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1u, &copy);
-    VkImageMemoryBarrier done = barriers[1];
-    done.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    done.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    done.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    done.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0u,
-                         0u, nullptr, 0u, nullptr, 1u, &done);
+// Where the eyes are when the frame is shown, and an image of each eye's
+// swapchain to copy their pictures into.
+bool QuestXr::stereo_begin(portablekit::gpu::xr::StereoFrame &stereo) {
+    if (!running_.load() || !visible_.load() || eye_extent_.width == 0u) return false;
+    const XrTime when = next_display_time_.load();
+    if (when == 0) return false;
+    std::array<XrView, 2> views{};
+    for (XrView &view : views) view.type = XR_TYPE_VIEW;
+    std::array<std::uint32_t, 2> index{};
+    {
+        std::lock_guard lock(xr_mutex_);
+        XrViewLocateInfo locate{XR_TYPE_VIEW_LOCATE_INFO};
+        locate.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+        locate.displayTime = when;
+        locate.space = local_;
+        XrViewState state{XR_TYPE_VIEW_STATE};
+        std::uint32_t count = 0;
+        if (!ok(xrLocateViews(session_, &locate, &state, 2u, &count, views.data()), "xrLocateViews") || count != 2u)
+            return false;
+        constexpr XrViewStateFlags kTracked =
+            XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_VALID_BIT;
+        if ((state.viewStateFlags & kTracked) != kTracked) return false;
+        for (std::size_t eye = 0; eye < 2u; ++eye) {
+            XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+            if (!ok(xrAcquireSwapchainImage(eye_swapchains_[eye], &acquire, &index[eye]), "xrAcquireSwapchainImage (eye)")) {
+                if (eye == 1u) {
+                    XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+                    xrReleaseSwapchainImage(eye_swapchains_[0], &release);
+                }
+                return false;
+            }
+        }
+    }
+    bool waited = true;
+    for (std::size_t eye = 0; eye < 2u; ++eye) {
+        XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+        wait.timeout = 100'000'000;  // 100 ms
+        waited = ok(xrWaitSwapchainImage(eye_swapchains_[eye], &wait), "xrWaitSwapchainImage (eye)") && waited;
+    }
+    if (!waited) {
+        std::lock_guard lock(xr_mutex_);
+        for (XrSwapchain swapchain : eye_swapchains_) {
+            XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+            xrReleaseSwapchainImage(swapchain, &release);
+        }
+        return false;
+    }
+    stereo.extent = eye_extent_;
+    for (std::size_t eye = 0; eye < 2u; ++eye) {
+        const XrView &view = views[eye];
+        eye_pose_[eye] = view.pose;
+        eye_fov_[eye] = view.fov;
+        eye_target_[eye] = eye_images_[eye][index[eye]].image;
+        auto &out = stereo.eyes[eye];
+        out.position = {view.pose.position.x, view.pose.position.y, view.pose.position.z};
+        out.orientation = {view.pose.orientation.x, view.pose.orientation.y, view.pose.orientation.z,
+                           view.pose.orientation.w};
+        out.tan_left = std::tan(view.fov.angleLeft);
+        out.tan_right = std::tan(view.fov.angleRight);
+        out.tan_up = std::tan(view.fov.angleUp);
+        out.tan_down = std::tan(view.fov.angleDown);
+    }
+    stereo_acquired_ = true;
+    if (stereo_presents_++ % 720u == 0u)
+        log("stereo frame %llu: eyes %.3f m apart, fov %.0f..%.0f x %.0f..%.0f degrees",
+            static_cast<unsigned long long>(stereo_presents_),
+            static_cast<double>(std::hypot(views[0].pose.position.x - views[1].pose.position.x,
+                                           views[0].pose.position.y - views[1].pose.position.y,
+                                           views[0].pose.position.z - views[1].pose.position.z)),
+            static_cast<double>(views[0].fov.angleLeft * 57.2958f), static_cast<double>(views[0].fov.angleRight * 57.2958f),
+            static_cast<double>(views[0].fov.angleDown * 57.2958f), static_cast<double>(views[0].fov.angleUp * 57.2958f));
+    return true;
+}
+
+void QuestXr::record_stereo(VkCommandBuffer commands, const std::array<VkImage, 2> &images, VkImageLayout layout,
+                            VkExtent2D extent) {
+    if (!stereo_acquired_) return;
+    for (std::size_t eye = 0; eye < 2u; ++eye)
+        record_copy(commands, images[eye], layout, eye_target_[eye],
+                    {std::min(extent.width, eye_extent_.width), std::min(extent.height, eye_extent_.height)});
 }
 
 void QuestXr::end_frame() {
-    if (!acquired_) return;
+    if (!acquired_ && !stereo_acquired_) return;
+    const bool panel = acquired_;
+    const bool stereo = stereo_acquired_;
     acquired_ = false;
+    stereo_acquired_ = false;
     VkSemaphore semaphore = semaphores_[next_semaphore_];
     next_semaphore_ = (next_semaphore_ + 1u) % semaphores_.size();
     std::lock_guard lock(xr_mutex_);
-    // The runtime's queue waits for the renderer's copy before the runtime
-    // uses the image it is about to be given.
+    // The runtime's queue waits for the renderer's copies before the runtime
+    // uses the images it is about to be given.
     const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.waitSemaphoreCount = 1u;
@@ -726,7 +913,19 @@ void QuestXr::end_frame() {
     submit.pWaitDstStageMask = &stage;
     if (vkQueueSubmit(xr_queue_, 1u, &submit, VK_NULL_HANDLE) != VK_SUCCESS) log("the runtime queue's wait failed");
     XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-    if (ok(xrReleaseSwapchainImage(swapchain_, &release), "xrReleaseSwapchainImage")) has_image_.store(true);
+    if (panel && ok(xrReleaseSwapchainImage(swapchain_, &release), "xrReleaseSwapchainImage")) has_image_.store(true);
+    if (stereo) {
+        bool released = true;
+        for (XrSwapchain swapchain : eye_swapchains_)
+            released = ok(xrReleaseSwapchainImage(swapchain, &release), "xrReleaseSwapchainImage (eye)") && released;
+        if (released) {
+            stereo_ready_.store(true);
+            shown_pose_ = eye_pose_;
+            shown_fov_ = eye_fov_;
+        }
+    }
+    // A present without the eyes' pictures (the frontend, the port's menu) shows the screen.
+    shown_stereo_ = stereo;
 }
 
 QuestXr &quest_xr() {

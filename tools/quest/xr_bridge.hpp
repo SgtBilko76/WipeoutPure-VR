@@ -29,10 +29,24 @@
 #include <vulkan/vulkan.h>
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <vector>
 
 namespace portablekit::gpu::xr {
+
+// One eye of a stereo frame, as the runtime located it: its pose in the
+// reference space (metres; x right, y up, -z forward) and the tangents of its
+// field of view's edges (left and down negative).
+struct EyeView {
+    std::array<float, 3> position{};
+    std::array<float, 4> orientation{0.0f, 0.0f, 0.0f, 1.0f};  // x, y, z, w
+    float tan_left{-1.0f}, tan_right{1.0f}, tan_up{1.0f}, tan_down{-1.0f};
+};
+struct StereoFrame {
+    VkExtent2D extent{};
+    std::array<EyeView, 2> eyes{};  // left, right
+};
 
 class Bridge {
 public:
@@ -71,7 +85,31 @@ public:
     // (shell/gamepad.hpp): read by the pad on every poll.
     [[nodiscard]] virtual bool button(int button) const = 0;
     [[nodiscard]] virtual float axis(int axis) const = 0;
+
+    // Stereo: while the game says its scene is 3D (set_scene_3d), the
+    // renderer draws the frame's 3D draws again for each eye, from the eye's
+    // pose and field of view, into two images of stereo_extent() (0 by 0: no
+    // stereo). In a present, after begin_frame() said yes: stereo_begin()
+    // (false: not now), then record_stereo() copies the two images into the
+    // runtime's eye swapchains, recorded in the same command buffer; the
+    // headset then shows them instead of the screen. A present without them
+    // shows the screen again.
+    [[nodiscard]] virtual VkExtent2D stereo_extent() const { return {0u, 0u}; }
+    virtual bool stereo_begin(StereoFrame &frame) { return (void)frame, false; }
+    virtual void record_stereo(VkCommandBuffer commands, const std::array<VkImage, 2> &images, VkImageLayout layout,
+                               VkExtent2D extent) {
+        (void)commands, (void)images, (void)layout, (void)extent;
+    }
 };
+
+// Set by the game once a frame: whether its picture is a 3D scene worth
+// showing in stereo (a race), rather than menus.
+inline std::atomic<bool> &scene_3d_slot() noexcept {
+    static std::atomic<bool> slot{false};
+    return slot;
+}
+inline void set_scene_3d(bool scene) noexcept { scene_3d_slot().store(scene, std::memory_order_relaxed); }
+[[nodiscard]] inline bool scene_3d() noexcept { return scene_3d_slot().load(std::memory_order_relaxed); }
 
 inline Bridge *&bridge_slot() noexcept {
     static Bridge *slot = nullptr;
