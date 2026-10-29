@@ -996,6 +996,9 @@ QuestXr &quest_xr() {
 // Registered when libmain.so loads, before the renderer starts.
 const bool kRegistered = [] {
     portablekit::gpu::xr::set_bridge(&quest_xr());
+    // A 60-fps race leaves 16.7 ms a frame: the performance hint asks for the clocks that finish the game's thread's
+    // work in about 12 (env.txt, read later, can set PURE_PERFORMANCE_HINT_MS=25 for 30-fps races).
+    setenv("PURE_PERFORMANCE_HINT_MS", "12", 0);
     return true;
 }();
 

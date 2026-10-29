@@ -450,4 +450,19 @@ edit(V, "        vec2 ndc = vec2(in_position.x / push.viewport.x, in_position.y 
      "        // (xr_bridge.hpp; the matrix gives device depth times w in z).\n"
      "        if (push.viewport.z > 1.5) gl_Position = push.transform * vec4(in_position.xyz, 1.0);\n")
 
+# The performance hint's target: <prefix>_PERFORMANCE_HINT_MS (a headset's 60-fps races want about half the default).
+H = "host/platform/android_performance.cpp"
+edit(H, "    hints.session = manager != nullptr ? create_session(manager, &thread, 1u, kTargetWorkNs) : nullptr;\n"
+        "    std::cout << \"[perf] performance hints \" << (hints.session != nullptr ? \"on\" : \"unavailable\")\n"
+        "              << \" for the game's thread, target \" << kTargetWorkNs / 1'000'000 << \" ms of work a frame\\n\";\n",
+     "    std::int64_t target = kTargetWorkNs;\n"
+     "    if (const char *text = portablekit::env(\"PERFORMANCE_HINT_MS\"); text != nullptr) {\n"
+     "        const double ms = std::strtod(text, nullptr);\n"
+     "        if (ms >= 2.0 && ms <= 100.0) target = static_cast<std::int64_t>(ms * 1'000'000.0);\n"
+     "    }\n"
+     "    hints.session = manager != nullptr ? create_session(manager, &thread, 1u, target) : nullptr;\n"
+     "    std::cout << \"[perf] performance hints \" << (hints.session != nullptr ? \"on\" : \"unavailable\")\n"
+     "              << \" for the game's thread, target \" << static_cast<double>(target) / 1'000'000.0\n"
+     "              << \" ms of work a frame\\n\";\n")
+
 print("changed:", sorted(set(changed)) or "nothing (already applied)")

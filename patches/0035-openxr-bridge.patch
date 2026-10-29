@@ -1244,6 +1244,28 @@ index f5c6539..1bf2aed 100644
      // Back opens the in-game menu instead of leaving the app.
      SDL_SetHint(SDL_HINT_ANDROID_TRAP_BACK_BUTTON, "1");
      unpack_bundled_fonts();
+diff --git a/host/platform/android_performance.cpp b/host/platform/android_performance.cpp
+index b5010ee..947a3e6 100644
+--- a/host/platform/android_performance.cpp
++++ b/host/platform/android_performance.cpp
+@@ -49,9 +49,15 @@ void open(Hints &hints) {
+     }
+     void *manager = get_manager();
+     const std::int32_t thread = static_cast<std::int32_t>(gettid());
+-    hints.session = manager != nullptr ? create_session(manager, &thread, 1u, kTargetWorkNs) : nullptr;
++    std::int64_t target = kTargetWorkNs;
++    if (const char *text = portablekit::env("PERFORMANCE_HINT_MS"); text != nullptr) {
++        const double ms = std::strtod(text, nullptr);
++        if (ms >= 2.0 && ms <= 100.0) target = static_cast<std::int64_t>(ms * 1'000'000.0);
++    }
++    hints.session = manager != nullptr ? create_session(manager, &thread, 1u, target) : nullptr;
+     std::cout << "[perf] performance hints " << (hints.session != nullptr ? "on" : "unavailable")
+-              << " for the game's thread, target " << kTargetWorkNs / 1'000'000 << " ms of work a frame\n";
++              << " for the game's thread, target " << static_cast<double>(target) / 1'000'000.0
++              << " ms of work a frame\n";
+ }
+ 
+ } // namespace
 diff --git a/host/shell/sdl_pad.cpp b/host/shell/sdl_pad.cpp
 index b381f84..9b1e95b 100644
 --- a/host/shell/sdl_pad.cpp

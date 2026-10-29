@@ -200,15 +200,15 @@ void sixty_fps(psprecomp::GuestMemory &m) {
 }
 
 #if defined(PURE_QUEST_VR)
-// The headset: a race at the PSP's 30 fps (the byte E4 sets to 1 put back to 0 while the backend lives), as Free Play
-// and Time Trial run on the PSP. The game integrates a measured dt, so the race keeps its speed; a stereo frame costs
-// the Quest about 30 ms, and at one vblank a frame (the free-running modes) the race fell to half speed. The headset
-// turns the picture with the head at its own 72 Hz between the game's frames. PURE_VR_RACE_FPS=60 keeps the game's own
-// choice (E4's option) to compare.
+// The headset: races at the game's own choice (E4's option, 60 fps by default) on the PSP's vblank, since the eyes
+// are drawn in a submit of their own (a stereo frame costs the Quest about 17 ms). PURE_VR_RACE_FPS=30 runs them at
+// the PSP's 30 fps instead (the byte E4 sets to 1 put back to 0 while the backend lives, as Free Play and Time Trial
+// run on the PSP); the game integrates a measured dt, so the race keeps its speed either way, and the headset turns
+// the picture with the head at its own refresh between the game's frames.
 bool vr_thirty_fps() {
     static const bool thirty = [] {
         const char *v = env("VR_RACE_FPS");
-        return v == nullptr || std::strcmp(v, "60") != 0;
+        return v != nullptr && std::strcmp(v, "30") == 0;
     }();
     return thirty;
 }
