@@ -42,7 +42,7 @@ index d9882e8..de4af9d 100644
          int enables = int(push.viewport.w + 0.5);
          if ((enables & 2) != 0) light_vertex(frag_color, frag_specular);
 diff --git a/host/gpu/vulkan_renderer.cpp b/host/gpu/vulkan_renderer.cpp
-index ef4fcb8..d24dabd 100644
+index ef4fcb8..3103441 100644
 --- a/host/gpu/vulkan_renderer.cpp
 +++ b/host/gpu/vulkan_renderer.cpp
 @@ -5,6 +5,7 @@
@@ -356,7 +356,7 @@ index ef4fcb8..d24dabd 100644
      // Emulated time running ahead of real time already presents faster than
      // the game's own rate; the keyboard's held frame is shown as it is.
      return frame_rate != settings::FrameRate::Fps30 && !settings::current().unthrottled && !holding && !fast_forward &&
-@@ -8050,6 +8187,484 @@ bool VulkanRenderer::Impl::present_between(const pacing::PresentClock::Present &
+@@ -8050,6 +8187,497 @@ bool VulkanRenderer::Impl::present_between(const pacing::PresentClock::Present &
      return true;
  }
  
@@ -620,7 +620,13 @@ index ef4fcb8..d24dabd 100644
 +        if (text != nullptr && std::strcmp(text, "off") == 0) return 2;
 +        return 0;
 +    }();
-+    std::uint32_t fullscreen = 0u;
++    std::uint32_t fullscreen = 0u, glows = 0u;
++    // A whole-screen draw textured from video memory is the game's glow: its own (flat, one-eyed) picture blurred and
++    // added on top. Over the eyes it lands beside what it lights and blinds; it is left out unless PURE_VR_GLOW=on.
++    static const bool glow_on = [] {
++        const char *text = portablekit::env("VR_GLOW");
++        return text != nullptr && std::strcmp(text, "on") == 0;
++    }();
 +    const bool tracing = trace_flat && eye == 0u && stereo_frames % 360u == 0u;
 +    bool scene_valid = false;
 +    EyeMatrix scene_clip{}, sprite_transform{};
@@ -680,14 +686,21 @@ index ef4fcb8..d24dabd 100644
 +                       }
 +                       const bool whole = x1 - x0 >= 0.9f * static_cast<float>(kPspWidth) &&
 +                                          y1 - y0 >= 0.9f * static_cast<float>(kPspHeight);
++                       const std::uint32_t texture = summary.texture_address & 0x0FFFFFFFu;
++                       const bool from_vram = texture >= 0x04000000u && texture < 0x04800000u;
 +                       if (tracing)
-+                           std::printf("[vr] screen-space draw: %u vertices, box %.0f,%.0f..%.0f,%.0f%s\n",
++                           std::printf("[vr] screen-space draw: %u vertices, box %.0f,%.0f..%.0f,%.0f, texture 0x%x%s\n",
 +                                       drawn.vertex_count, static_cast<double>(x0), static_cast<double>(y0),
-+                                       static_cast<double>(x1), static_cast<double>(y1),
-+                                       whole ? ": the whole screen" : "");
++                                       static_cast<double>(x1), static_cast<double>(y1), summary.texture_address,
++                                       whole ? (from_vram ? ": the whole screen, the glow" : ": the whole screen") : "");
++                       if (whole && from_vram && !glow_on) return 2;
 +                       return whole && fullscreen_mode != 1 ? 1 : 0;
 +                   }();
 +                   cover != 0) {
++            if (cover == 2) {
++                ++glows;
++                continue;
++            }
 +            if (fullscreen_mode == 2) continue;
 +            state.viewport = {0.0f, 0.0f, width, height, min_depth, max_depth};
 +            state.scissor = all;
@@ -821,9 +834,9 @@ index ef4fcb8..d24dabd 100644
 +    // Every five seconds or so: what the eyes drew, and the numbers that say
 +    // whether the game's eye space was read right and how big its units are.
 +    if (eye == 0u && stereo_frames++ % 360u == 0u) {
-+        std::printf("[vr] stereo: %u 3D, %u full-screen, %u sprite and %u flat draw calls, eye %ux%u, nearest 3D object %.2f units away, "
++        std::printf("[vr] stereo: %u 3D, %u full-screen (%u glow left out), %u sprite and %u flat draw calls, eye %ux%u, nearest 3D object %.2f units away, "
 +                    "%.3g units a metre, interface %.0f..%.0f x %.0f..%.0f\n",
-+                    perspective, fullscreen, sprites, flat, target.extent.width, target.extent.height, static_cast<double>(nearest),
++                    perspective, fullscreen, glows, sprites, flat, target.extent.width, target.extent.height, static_cast<double>(nearest),
 +                    static_cast<double>(scale), static_cast<double>(hud_left), static_cast<double>(hud_right),
 +                    static_cast<double>(hud_top), static_cast<double>(hud_bottom));
 +        for (const interpolation::DrawSummary &summary : frame.summaries) {
@@ -841,7 +854,7 @@ index ef4fcb8..d24dabd 100644
  // Draws the older frame into the slot's blend target with every matched
  // draw's transforms blended a fraction `t` towards the newer frame's. Draws
  // without a partner in the newer frame, and those never blended (2D, the
-@@ -8464,6 +9079,7 @@ void VulkanRenderer::Impl::reset_interpolation() {
+@@ -8464,6 +9092,7 @@ void VulkanRenderer::Impl::reset_interpolation() {
  void VulkanRenderer::Impl::destroy_interpolation_targets() {
      for (Target &picture : pictures) destroy_target(picture);
      for (Target &target : blend_targets) destroy_target(target);
@@ -849,7 +862,7 @@ index ef4fcb8..d24dabd 100644
      older_picture_valid = newer_picture_valid = false;
  }
  
-@@ -8646,8 +9262,14 @@ bool VulkanRenderer::present(std::uint32_t display_address,
+@@ -8646,8 +9275,14 @@ bool VulkanRenderer::present(std::uint32_t display_address,
          impl.poll_presents(std::chrono::steady_clock::now(), false, false);
          return false;
      }
