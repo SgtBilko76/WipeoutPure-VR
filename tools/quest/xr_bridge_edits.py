@@ -207,9 +207,6 @@ edit(R, "#if defined(__ANDROID__)\n"
         "        else\n"
         "#endif\n"
         "            transition(commands, target, layout, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);\n",
-     "        // The eyes, when the frame is a 3D scene and the port's menu is closed: drawn in a submit after this\n"
-     "        // one (submit_stereo), and the headset shows them instead of the screen, which is not copied then.\n"
-     "        const bool eyes = xr && main_frame && game_frame && !draw_ui && begin_stereo();\n"
      "        if (xr) {\n"
      "            transition(commands, target, layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);\n"
      "            if (!eyes)\n"
@@ -408,6 +405,7 @@ edit(R, "    void replay(VkCommandBuffer commands, std::uint32_t slot, float t);
      "    VkQueryPool eye_timer{};  // the eye passes' GPU time, a pair per frame slot\n"
      "    std::array<bool, 2> eye_timed{};  // by present slot\n"
      "    xr::StereoFrame stereo_frame{};\n"
+     "    double frame_end_ms{}, eye_submit_ms{};  // CPU time, summed until logged\n"
      "    bool stereo_begun{};  // the frame being submitted has its eyes drawn after it (submit_stereo)\n"
      "    double eye_gpu_ms{};\n"
      "    std::uint32_t eye_gpu_samples{};\n"
@@ -464,5 +462,42 @@ edit(H, "    hints.session = manager != nullptr ? create_session(manager, &threa
      "    std::cout << \"[perf] performance hints \" << (hints.session != nullptr ? \"on\" : \"unavailable\")\n"
      "              << \" for the game's thread, target \" << static_cast<double>(target) / 1'000'000.0\n"
      "              << \" ms of work a frame\\n\";\n")
+
+# A frame whose eyes are drawn skips the screen's copy and the overlay: the headset shows the eyes.
+edit(R, "        transition(commands, target, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);\n"
+        "        if (source != VK_NULL_HANDLE) {\n",
+     "        // The eyes, when the frame is a 3D scene and the port's menu is closed: drawn in a submit after this\n"
+     "        // one (submit_stereo), and the headset shows them instead of the screen, which is not drawn then.\n"
+     "        const bool eyes = xr && main_frame && game_frame && !draw_ui && begin_stereo();\n"
+     "        transition(commands, target, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);\n"
+     "        if (eyes) {\n"
+     "            // Nothing on the screen's image.\n"
+     "        } else if (source != VK_NULL_HANDLE) {\n")
+edit(R, "        if (game_frame && overlay_visible) {\n            const perf::Clock::time_point overlay_start",
+     "        if (game_frame && overlay_visible && !eyes) {\n            const perf::Clock::time_point overlay_start")
+
+# The game's own frame at a lower resolution in a race (the headset shows the eyes, drawn from the game's
+# textures and geometry): <prefix>_VR_RACE_SCALE (default 1, 480x272; 0 keeps the menu's).
+edit(R, "VkExtent2D VulkanRenderer::Impl::wanted_target_extent() const {\n"
+        "    const bool known = content_rect.extent.width != 0u && content_rect.extent.height != 0u;\n",
+     "VkExtent2D VulkanRenderer::Impl::wanted_target_extent() const {\n"
+     "    std::uint32_t requested_scale = this->requested_scale;\n"
+     "    if (xr && xr::scene_3d()) {\n"
+     "        // A headset's race shows the eyes, not this frame: its targets at a lower resolution (xr_bridge.hpp).\n"
+     "        static const std::uint32_t race_scale = [] {\n"
+     "            const char *text = portablekit::env(\"VR_RACE_SCALE\");\n"
+     "            return text != nullptr ? static_cast<std::uint32_t>(std::atoi(text)) : 1u;\n"
+     "        }();\n"
+     "        if (race_scale != 0u) requested_scale = std::min(race_scale, settings::kMaxInternalScale);\n"
+     "    }\n"
+     "    const bool known = content_rect.extent.width != 0u && content_rect.extent.height != 0u;\n")
+
+# CPU time of the frame's end and the eyes' end and submit (a GPU behind shows up there).
+edit(R, "    vkEndCommandBuffer(commands);\n\n    const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;\n",
+     "    const perf::Clock::time_point end_start = perf::Clock::now();\n"
+     "    vkEndCommandBuffer(commands);\n"
+     "    if (xr && main_frame)\n"
+     "        frame_end_ms += std::chrono::duration<double, std::milli>(perf::Clock::now() - end_start).count();\n\n"
+     "    const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;\n")
 
 print("changed:", sorted(set(changed)) or "nothing (already applied)")

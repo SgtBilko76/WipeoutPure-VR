@@ -230,6 +230,7 @@ void VulkanRenderer::Impl::submit_stereo() {
     for (const Target &target : eye_targets)
         transition(commands, target.color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    const perf::Clock::time_point submit_start = perf::Clock::now();
     vkEndCommandBuffer(commands);
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1u;
@@ -240,6 +241,7 @@ void VulkanRenderer::Impl::submit_stereo() {
         submit.pSignalSemaphores = &signal;
     }
     if (vkQueueSubmit(queue, 1u, &submit, fence) == VK_ERROR_DEVICE_LOST) device_lost("the eyes' submit");
+    eye_submit_ms += std::chrono::duration<double, std::milli>(perf::Clock::now() - submit_start).count();
 }
 
 void VulkanRenderer::Impl::replay_eye(VkCommandBuffer commands, Target &target, const xr::StereoFrame &stereo,
@@ -570,8 +572,13 @@ void VulkanRenderer::Impl::replay_eye(VkCommandBuffer commands, Target &target, 
     // whether the game's eye space was read right and how big its units are.
     if (eye == 0u && stereo_frames++ % 360u == 0u) {
         if (eye_gpu_samples != 0u)
-            std::printf("[vr] GPU time of the two eyes: %.2f ms a frame (%u frames)\n",
-                        eye_gpu_ms / static_cast<double>(eye_gpu_samples), eye_gpu_samples);
+            std::printf("[vr] GPU time of the two eyes: %.2f ms a frame (%u frames); CPU: the frame's end %.2f ms, "
+                        "the eyes' end and submit %.2f ms; game frame %ux%u\n",
+                        eye_gpu_ms / static_cast<double>(eye_gpu_samples), eye_gpu_samples,
+                        frame_end_ms / static_cast<double>(eye_gpu_samples),
+                        eye_submit_ms / static_cast<double>(eye_gpu_samples), target_extent.width,
+                        target_extent.height);
+        frame_end_ms = eye_submit_ms = 0.0;
         eye_gpu_ms = 0.0;
         eye_gpu_samples = 0u;
         std::printf("[vr] stereo: %u 3D, %u full-screen (%u glow left out), %u sprite and %u flat draw calls, eye %ux%u, nearest 3D object %.2f units away, "
