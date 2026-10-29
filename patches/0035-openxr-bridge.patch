@@ -1,0 +1,488 @@
+diff --git a/host/gpu/vulkan_renderer.cpp b/host/gpu/vulkan_renderer.cpp
+index ef4fcb8..0f0417d 100644
+--- a/host/gpu/vulkan_renderer.cpp
++++ b/host/gpu/vulkan_renderer.cpp
+@@ -5,6 +5,7 @@
+ #include "vulkan_renderer.hpp"
+ 
+ #include "frame_interpolation.hpp"
++#include "xr_bridge.hpp"
+ #include "frame_pacing.hpp"
+ #include "replacement_textures.hpp"
+ #include "texture_decode.hpp"
+@@ -1874,6 +1875,11 @@ struct VulkanRenderer::Impl : host::SdlPad {
+     bool recording{};
+     bool quit{};
+     bool ready{};
++    // Presenting to an OpenXR runtime (xr_bridge.hpp) instead of the window:
++    // the swapchain images are the renderer's own, xr_memory their memory.
++    bool xr{};
++    std::uint32_t xr_next_image{};
++    std::vector<VkDeviceMemory> xr_memory;
+     std::uint64_t frames{};
+     std::uint64_t draws{};
+ 
+@@ -1997,6 +2003,7 @@ struct VulkanRenderer::Impl : host::SdlPad {
+     }
+     [[nodiscard]] VkPresentModeKHR wanted_present_mode() const;
+     bool create_swapchain(std::string &error);
++    bool create_xr_images(std::string &error);
+     void destroy_swapchain_views();
+     void recreate_swapchain();
+ #if defined(__ANDROID__)
+@@ -2029,6 +2036,7 @@ struct VulkanRenderer::Impl : host::SdlPad {
+     // frame. So the swapchain is rebuilt only when the display's transform or
+     // the window's size really changed: once per turn of the phone.
+     void check_swapchain() {
++        if (xr) return;
+         if (!std::exchange(swapchain_check, false) || swapchain == VK_NULL_HANDLE) return;
+ #if defined(__ANDROID__)
+         VkSurfaceCapabilitiesKHR capabilities{};
+@@ -2337,6 +2345,21 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
+         if (std::strcmp(extension.extensionName, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) == 0)
+             portability_enumeration = true;
+     if (portability_enumeration) extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
++    // A headset (xr_bridge.hpp): the runtime's instance extensions too, each once.
++    xr::Bridge *const xr_bridge = xr::bridge();
++    const bool xr_wanted = xr_bridge != nullptr && xr_bridge->prepare();
++    const auto add_unique = [](std::vector<const char *> &list, const std::vector<const char *> &more) {
++        for (const char *name : more) {
++            bool have = false;
++            for (const char *existing : list) have = have || std::strcmp(existing, name) == 0;
++            if (!have) list.push_back(name);
++        }
++    };
++    if (xr_wanted) {
++        std::vector<const char *> wanted;
++        xr_bridge->instance_extensions(wanted);
++        add_unique(extensions, wanted);
++    }
+ 
+     VkApplicationInfo application{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+     application.pApplicationName = portablekit::game().app_name;
+@@ -2377,6 +2400,9 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
+         }
+     }
+ 
++    if (xr_wanted) {
++        if (VkPhysicalDevice chosen = xr_bridge->physical_device(impl.instance)) impl.physical_device = chosen;
++    }
+     std::uint32_t family_count = 0u;
+     vkGetPhysicalDeviceQueueFamilyProperties(impl.physical_device, &family_count, nullptr);
+     std::vector<VkQueueFamilyProperties> families(family_count);
+@@ -2411,6 +2437,11 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
+             impl.breadcrumbs.available = true;
+         }
+     }
++    if (xr_wanted) {
++        std::vector<const char *> wanted;
++        xr_bridge->device_extensions(impl.physical_device, wanted);
++        add_unique(enabled_device_extensions, wanted);
++    }
+     if (want_breadcrumbs && !impl.breadcrumbs.available)
+         std::cout << "[render] " << portablekit::env_name("GPU_BREADCRUMBS") << " needs VK_AMD_buffer_marker, which this device lacks\n";
+ 
+@@ -2473,6 +2504,13 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
+     if (!check(vkCreateDevice(impl.physical_device, &device_info, nullptr, &impl.device), "vkCreateDevice", error))
+         return false;
+     vkGetDeviceQueue(impl.device, impl.queue_family, 0u, &impl.queue);
++    if (xr_wanted) {
++        impl.xr = xr_bridge->start(impl.instance, impl.physical_device, impl.device, impl.queue_family, 0u);
++        xr::active_slot() = impl.xr;
++        std::cout << "[render] OpenXR "
++                  << (impl.xr ? "session started: frames go to the headset" : "failed: frames go to the window")
++                  << std::endl;
++    }
+     if (impl.breadcrumbs.available) {
+         Impl::Breadcrumbs &b = impl.breadcrumbs;
+         VkBufferCreateInfo marker_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+@@ -2520,6 +2558,7 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
+         }
+     }
+     impl.swapchain_format = impl.surface_format.format;
++    if (impl.xr) impl.swapchain_format = VK_FORMAT_R8G8B8A8_UNORM;
+     std::uint32_t mode_count = 0u;
+     vkGetPhysicalDeviceSurfacePresentModesKHR(impl.physical_device, impl.surface, &mode_count, nullptr);
+     impl.present_modes.resize(mode_count);
+@@ -3086,6 +3125,7 @@ VkPresentModeKHR VulkanRenderer::Impl::wanted_present_mode() const {
+ 
+ // Builds the swapchain for the window's current size, replacing the old one.
+ bool VulkanRenderer::Impl::create_swapchain(std::string &error) {
++    if (xr) return create_xr_images(error);
+     VkSurfaceCapabilitiesKHR capabilities{};
+     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface, &capabilities);
+     VkExtent2D extent = capabilities.currentExtent;
+@@ -3194,6 +3234,60 @@ bool VulkanRenderer::Impl::create_swapchain(std::string &error) {
+     return true;
+ }
+ 
++// The headset's frames (xr_bridge.hpp): three images of the panel's size,
++// made once, which the bridge copies into the runtime's swapchain.
++bool VulkanRenderer::Impl::create_xr_images(std::string &error) {
++    const VkExtent2D extent = xr::bridge()->panel_extent();
++    swapchain_quarter_turns = 0;
++    swapchain_image_extent = extent;
++    swapchain_extent = extent;
++    update_content_rect();
++    swapchain_usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
++                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++    constexpr std::uint32_t kImages = 3u;
++    while (swapchain_images.size() < kImages) {
++        VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
++        image_info.imageType = VK_IMAGE_TYPE_2D;
++        image_info.format = swapchain_format;
++        image_info.extent = {extent.width, extent.height, 1u};
++        image_info.mipLevels = 1u;
++        image_info.arrayLayers = 1u;
++        image_info.samples = VK_SAMPLE_COUNT_1_BIT;
++        image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
++        image_info.usage = swapchain_usage;
++        image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++        VkImage image{};
++        if (!check(vkCreateImage(device, &image_info, nullptr, &image), "vkCreateImage", error)) return false;
++        VkMemoryRequirements requirements{};
++        vkGetImageMemoryRequirements(device, image, &requirements);
++        VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++        allocate.allocationSize = requirements.size;
++        allocate.memoryTypeIndex = find_memory_type(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++        VkDeviceMemory memory{};
++        if (!check(vkAllocateMemory(device, &allocate, nullptr, &memory), "vkAllocateMemory", error)) return false;
++        vkBindImageMemory(device, image, memory, 0u);
++        swapchain_images.push_back(image);
++        xr_memory.push_back(memory);
++    }
++    for (VkImage image : swapchain_images) {
++        VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
++        view_info.image = image;
++        view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
++        view_info.format = swapchain_format;
++        view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u};
++        VkImageView view{};
++        if (!check(vkCreateImageView(device, &view_info, nullptr, &view), "vkCreateImageView", error)) return false;
++        swapchain_views.push_back(view);
++    }
++    swapchain_min_images = kImages;
++    if (ui_render_pass != VK_NULL_HANDLE && !create_ui_framebuffers(error)) return false;
++    swapchain_dirty = false;
++    update_display_info();
++    std::cout << "[render] headset panel " << extent.width << "x" << extent.height << ", " << kImages
++              << " images" << std::endl;
++    return true;
++}
++
+ void VulkanRenderer::Impl::destroy_swapchain_views() {
+     for (VkFramebuffer framebuffer : ui_framebuffers) vkDestroyFramebuffer(device, framebuffer, nullptr);
+     ui_framebuffers.clear();
+@@ -3226,6 +3320,7 @@ void VulkanRenderer::Impl::reset_surface() {
+ #endif
+ 
+ void VulkanRenderer::Impl::recreate_swapchain() {
++    if (xr) return;  // the panel keeps its size
+     // A minimised window has no area to present to; keep the old swapchain
+     // and try again once it has one.
+     int width = 0;
+@@ -3535,11 +3630,15 @@ void VulkanRenderer::Impl::record_game_blit(VkCommandBuffer commands, VkImage so
+ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence fence, VkImage source,
+                                               VkExtent2D source_extent, bool game_frame, bool main_frame) {
+ #if defined(__ANDROID__)
+-    check_native_window();
+-    if (surface_returned) reset_surface();
++    if (!xr) {
++        check_native_window();
++        if (surface_returned) reset_surface();
++    }
+     // No window to show it in: the frame is recorded and finished, not shown
+     // (an image acquired before the window went is still given back).
+-    if (!surface_lost)
++    if (!surface_lost && !xr)
++#else
++    if (!xr)
+ #endif
+     if (!acquired_image) {
+         check_swapchain();
+@@ -3561,7 +3660,15 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
+ 
+     std::uint32_t image_index = 0u;
+     VkResult acquired = VK_ERROR_OUT_OF_DATE_KHR;
+-    if (acquired_image) {
++    if (xr) {
++        // The runtime paces the frame (xrWaitFrame); one of the panel images takes it.
++        if (xr::bridge()->begin_frame() && has_content && !swapchain_images.empty()) {
++            image_index = xr_next_image;
++            xr_next_image = (xr_next_image + 1u) % static_cast<std::uint32_t>(swapchain_images.size());
++            acquired = VK_SUCCESS;
++        }
++        acquired_image.reset();
++    } else if (acquired_image) {
+         image_index = *acquired_image;
+         acquired = VK_SUCCESS;
+         acquired_image.reset();
+@@ -3645,6 +3752,10 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
+                 capture = true;
+             }
+         }
++        if (xr) {
++            transition(commands, target, layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++            xr::bridge()->record_present(commands, target, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, swapchain_extent);
++        } else
+ #if defined(__ANDROID__)
+         if (prerotated() && image_index < upright_images.size()) record_rotation(commands, image_index, layout);
+         else
+@@ -3658,7 +3769,7 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
+     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+     submit.commandBufferCount = frame_batch(commands, batch);
+     submit.pCommandBuffers = batch.data();
+-    if (can_present) {
++    if (can_present && !xr) {
+         submit.waitSemaphoreCount = 1u;
+         submit.pWaitSemaphores = &acquire;
+         submit.pWaitDstStageMask = &wait_stage;
+@@ -3670,7 +3781,8 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
+     if (vkQueueSubmit(queue, 1u, &submit, fence) == VK_ERROR_DEVICE_LOST) device_lost("a frame's submit");
+     perf::add_wait_time(perf::Clock::now() - submit_start, perf::Stall::Submit);
+ 
+-    if (can_present) {
++    if (xr) xr::bridge()->end_frame();
++    if (can_present && !xr) {
+         VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+         present.waitSemaphoreCount = 1u;
+         present.pWaitSemaphores = &render_finished[image_index];
+@@ -7719,6 +7831,7 @@ double VulkanRenderer::Impl::wanted_rate() const {
+ }
+ 
+ bool VulkanRenderer::Impl::interpolation_wanted() const {
++    if (xr) return false;
+     // Emulated time running ahead of real time already presents faster than
+     // the game's own rate; the keyboard's held frame is shown as it is.
+     return frame_rate != settings::FrameRate::Fps30 && !settings::current().unthrottled && !holding && !fast_forward &&
+diff --git a/host/gpu/xr_bridge.hpp b/host/gpu/xr_bridge.hpp
+new file mode 100644
+index 0000000..55ee545
+--- /dev/null
++++ b/host/gpu/xr_bridge.hpp
+@@ -0,0 +1,80 @@
++#pragma once
++
++// An OpenXR runtime that the Vulkan renderer presents into instead of its
++// window: a standalone VR headset. A game that wants one sets it with
++// set_bridge() before the renderer starts. Without a bridge, or when
++// prepare() says no, the renderer presents to its window as before.
++//
++// What the renderer does with an active bridge:
++// - It asks for the runtime's Vulkan instance and device extensions, renders
++//   on the runtime's physical device and hands the device and its queue over
++//   (start()).
++// - Its "swapchain" is a ring of its own images at panel_extent(), in a plain
++//   8-bit UNORM format, so the picture and the in-game menu are drawn into
++//   them exactly as into a window. Each present calls begin_frame(), records
++//   the frame into one of them, then record_present() copies that image into
++//   the runtime's swapchain in the same command buffer, and end_frame()
++//   follows the queue submit.
++// - It does not present to the window, and frame interpolation is off.
++// - The bridge's eye pass (stereo) runs from record_present(): it gets the
++//   renderer's hooks through set_eye_renderer() below.
++//
++// All calls come from the renderer's thread.
++
++#include <vulkan/vulkan.h>
++
++#include <array>
++#include <cstdint>
++#include <vector>
++
++namespace portablekit::gpu::xr {
++
++class Bridge {
++public:
++    virtual ~Bridge() = default;
++
++    // Before vkCreateInstance. False: no headset, present to the window.
++    virtual bool prepare() = 0;
++    virtual void instance_extensions(std::vector<const char *> &extensions) = 0;
++    // After vkCreateInstance: the device the runtime renders with, or null.
++    virtual VkPhysicalDevice physical_device(VkInstance instance) = 0;
++    virtual void device_extensions(VkPhysicalDevice physical_device, std::vector<const char *> &extensions) = 0;
++    // After vkCreateDevice. False: the session could not start; the
++    // renderer then presents to its window.
++    virtual bool start(VkInstance instance, VkPhysicalDevice physical_device, VkDevice device,
++                       std::uint32_t queue_family, std::uint32_t queue_index) = 0;
++
++    // The size of the virtual screen the renderer draws its frames at.
++    [[nodiscard]] virtual VkExtent2D panel_extent() const = 0;
++
++    // A present. begin_frame() false: the runtime shows nothing this frame
++    // (the session is not visible); end_frame() is still called.
++    virtual bool begin_frame() = 0;
++    // `image` holds the frame in `layout` (TRANSFER_SRC_OPTIMAL), `extent`
++    // big. Copies it into the runtime's swapchain.
++    virtual void record_present(VkCommandBuffer commands, VkImage image, VkImageLayout layout,
++                                VkExtent2D extent) = 0;
++    // After the command buffer was submitted.
++    virtual void end_frame() = 0;
++
++    // The Touch controllers, as SDL3 numbers a gamepad's buttons and axes
++    // (shell/gamepad.hpp): read by the pad on every poll.
++    [[nodiscard]] virtual bool button(int button) const = 0;
++    [[nodiscard]] virtual float axis(int axis) const = 0;
++};
++
++inline Bridge *&bridge_slot() noexcept {
++    static Bridge *slot = nullptr;
++    return slot;
++}
++inline void set_bridge(Bridge *bridge) noexcept { bridge_slot() = bridge; }
++[[nodiscard]] inline Bridge *bridge() noexcept { return bridge_slot(); }
++
++// Set by the renderer once start() has succeeded.
++inline bool &active_slot() noexcept {
++    static bool slot = false;
++    return slot;
++}
++[[nodiscard]] inline bool active() noexcept { return active_slot() && bridge() != nullptr; }
++
++} // namespace portablekit::gpu::xr
+diff --git a/host/platform/android_app.cpp b/host/platform/android_app.cpp
+index f5c6539..7805600 100644
+--- a/host/platform/android_app.cpp
++++ b/host/platform/android_app.cpp
+@@ -11,6 +11,9 @@
+ #include <SDL3/SDL_main.h>
+ 
+ #include <pthread.h>
++#include <cstdlib>
++#include <cstring>
++#include <vector>
+ 
+ #include <cstdint>
+ #include <cstdio>
+@@ -85,10 +88,82 @@ void unpack_bundled_fonts() {
+     portablekit::set_bundled_resource_directory(root);
+ }
+ 
++#if defined(PORTABLEKIT_ANDROID_EXTERNAL_DATA)
++// Unpacks a ustar archive (regular files and directories) into `into`.
++bool unpack_tar(const std::filesystem::path &tar, const std::filesystem::path &into) {
++    std::ifstream in(tar, std::ios::binary);
++    if (!in) return false;
++    std::vector<char> buffer(1u << 20);
++    char header[512];
++    std::error_code ec;
++    std::size_t files = 0;
++    while (in.read(header, sizeof(header))) {
++        if (header[0] == '\0') break;  // the end: zero blocks
++        const auto field = [&](std::size_t at, std::size_t length) {
++            return std::string(header + at, strnlen(header + at, length));
++        };
++        std::string name = field(0, 100);
++        if (std::memcmp(header + 257, "ustar", 5) == 0 && header[345] != '\0') name = field(345, 155) + "/" + name;
++        const std::uint64_t size = std::strtoull(field(124, 12).c_str(), nullptr, 8);
++        const char type = header[156];
++        const std::filesystem::path relative = std::filesystem::path(name).lexically_normal();
++        const bool safe = !relative.empty() && relative.is_relative() && *relative.begin() != "..";
++        const std::filesystem::path target = into / relative;
++        if (safe && type == '5') {
++            std::filesystem::create_directories(target, ec);
++        } else if (safe && (type == '0' || type == '\0')) {
++            std::filesystem::create_directories(target.parent_path(), ec);
++            std::ofstream out(target, std::ios::binary | std::ios::trunc);
++            std::uint64_t left = size;
++            while (left > 0 && in) {
++                const auto chunk = static_cast<std::streamsize>(std::min<std::uint64_t>(left, buffer.size()));
++                in.read(buffer.data(), chunk);
++                out.write(buffer.data(), in.gcount());
++                left -= static_cast<std::uint64_t>(in.gcount());
++            }
++            if (left != 0) return false;
++            ++files;
++            in.seekg(static_cast<std::streamoff>((512u - size % 512u) % 512u), std::ios::cur);
++            continue;
++        }
++        in.seekg(static_cast<std::streamoff>((size + 511u) / 512u * 512u), std::ios::cur);
++    }
++    std::printf("[android] unpacked %zu files from %s\n", files, tar.filename().c_str());
++    return true;
++}
++
++void use_external_storage() {
++    const char *external = SDL_GetAndroidExternalStoragePath();
++    if (external == nullptr) return;
++    const std::filesystem::path root(external);
++    std::error_code ec;
++    std::filesystem::create_directories(root / "import", ec);
++    std::filesystem::create_directories(root / "game" / "ms0" / "PSP" / "SAVEDATA", ec);
++    std::vector<std::filesystem::path> archives;
++    for (const auto &entry : std::filesystem::directory_iterator(root / "import", ec))
++        if (entry.path().extension() == ".tar") archives.push_back(entry.path());
++    for (const std::filesystem::path &archive : archives) {
++        if (unpack_tar(archive, root)) std::filesystem::remove(archive, ec);
++        else std::printf("[android] cannot unpack %s\n", archive.c_str());
++    }
++    setenv(portablekit::env_name("DATA_DIR").c_str(), root.c_str(), 0);
++    const std::filesystem::path game = root / "game";
++    if (std::filesystem::is_regular_file(game / "disc.iso", ec) &&
++        std::filesystem::is_regular_file(game / "EBOOT.ELF", ec))
++        setenv(portablekit::env_name("GAME_DIR").c_str(), game.c_str(), 0);
++    std::printf("[android] data in %s, game %s\n", root.c_str(),
++                std::getenv(portablekit::env_name("GAME_DIR").c_str()) != nullptr ? "found" : "not there yet");
++    std::fflush(stdout);
++}
++#endif
++
+ } // namespace
+ 
+ int main(int argc, char *argv[]) {
+     redirect_output();
++#if defined(PORTABLEKIT_ANDROID_EXTERNAL_DATA)
++    use_external_storage();
++#endif
+     // Back opens the in-game menu instead of leaving the app.
+     SDL_SetHint(SDL_HINT_ANDROID_TRAP_BACK_BUTTON, "1");
+     unpack_bundled_fonts();
+diff --git a/host/shell/sdl_pad.cpp b/host/shell/sdl_pad.cpp
+index b381f84..9b1e95b 100644
+--- a/host/shell/sdl_pad.cpp
++++ b/host/shell/sdl_pad.cpp
+@@ -4,6 +4,7 @@
+ #include "ui/input_script.hpp"
+ 
+ #include "settings/settings.hpp"
++#include "gpu/xr_bridge.hpp"
+ 
+ #include <algorithm>
+ #include <cmath>
+@@ -167,6 +168,11 @@ void SdlPad::sample(bool focused, bool mouse_captured, std::uint32_t mouse_butto
+ 
+     // The gamepad adds to the same bits and offsets, so both sources are live.
+     if (gamepad != nullptr) read_gamepad(gamepad, next, analog_x, analog_y);
++    // A headset's controllers (gpu/xr_bridge.hpp), through the same mapping.
++    if (const gpu::xr::Bridge *xr = gpu::xr::active() ? gpu::xr::bridge() : nullptr) {
++        read_gamepad([xr](GamepadButton button) { return xr->button(static_cast<int>(button)); },
++                     [xr](GamepadAxis id) { return xr->axis(static_cast<int>(id)); }, next, analog_x, analog_y);
++    }
+     // So do the on-screen controls.
+     if (touch != nullptr) {
+         next.buttons |= touch->buttons();
+diff --git a/host/ui/layer.cpp b/host/ui/layer.cpp
+index 788284b..33c14e6 100644
+--- a/host/ui/layer.cpp
++++ b/host/ui/layer.cpp
+@@ -10,6 +10,7 @@
+ #include "install/user_data.hpp"
+ #include "settings/settings.hpp"
+ #include "shell/shell.hpp"
++#include "gpu/xr_bridge.hpp"
+ 
+ #include "backends/imgui_impl_sdl3.h"
+ #include "imgui.h"
+@@ -338,6 +339,11 @@ void Layer::begin_frame() {
+     shell_->begin_ui_frame();
+     ImGui_ImplSDL3_NewFrame();
+     ImGuiIO &io = ImGui::GetIO();
++    if (gpu::xr::active()) {
++        const VkExtent2D panel = gpu::xr::bridge()->panel_extent();
++        io.DisplaySize = {static_cast<float>(panel.width), static_cast<float>(panel.height)};
++        io.DisplayFramebufferScale = {1.0f, 1.0f};
++    }
+     io.ConfigNavSwapGamepadButtons = !confirm_south();
+     if (!gamepad_armed_) gamepad_armed_ = !face_button_held();
+     if (gamepad_armed_) io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;

@@ -58,6 +58,26 @@ message(STATUS "PURE_MODELS: ${PURE_MODELS} (the crowd and sky rows and the mode
 include(cmake/Zstd.cmake)
 target_link_libraries(PureNative PRIVATE pure_zstd_decoder)
 
+# Wipeout Pure VR (README-QUEST.md): the Android app for Meta Quest and PICO headsets, presenting through OpenXR
+# (src/vr/quest_xr.cpp and the framework's host/gpu/xr_bridge.hpp). PURE_OPENXR_DIR is the unpacked
+# openxr_loader_for_android AAR from Maven Central (packaging/quest/build_quest.sh fetches it).
+option(PURE_QUEST_VR "Build the Quest/PICO VR app (Android, OpenXR)" OFF)
+if(PURE_QUEST_VR)
+    if(NOT ANDROID OR NOT PORTABLEKIT_ANDROID_APP)
+        message(FATAL_ERROR "PURE_QUEST_VR needs the Android NDK toolchain and PORTABLEKIT_ANDROID_APP=ON")
+    endif()
+    set(PURE_OPENXR_DIR "" CACHE PATH "The unpacked openxr_loader_for_android AAR")
+    set(pure_openxr_loader "${PURE_OPENXR_DIR}/prefab/modules/openxr_loader/libs/android.${ANDROID_ABI}/libopenxr_loader.so")
+    if(NOT EXISTS "${pure_openxr_loader}")
+        message(FATAL_ERROR "PURE_QUEST_VR: no OpenXR loader at ${pure_openxr_loader} (set PURE_OPENXR_DIR)")
+    endif()
+    target_sources(PureNative PRIVATE src/vr/quest_xr.cpp)
+    target_include_directories(PureNative PRIVATE "${PURE_OPENXR_DIR}/prefab/modules/headers/include")
+    target_link_libraries(PureNative PRIVATE "${pure_openxr_loader}" log)
+    target_compile_definitions(PureNative PRIVATE PURE_QUEST_VR=1 PORTABLEKIT_ANDROID_EXTERNAL_DATA=1)
+    message(STATUS "PURE_QUEST_VR: OpenXR loader ${pure_openxr_loader}")
+endif()
+
 # The Windows release (task 061, docs/release.md "Windows"): the windows subsystem, so a player who starts the program
 # from Explorer gets no console window; the entry stays the C runtime's main(). The developer build keeps the console
 # subsystem, whose stdout every tool reads.

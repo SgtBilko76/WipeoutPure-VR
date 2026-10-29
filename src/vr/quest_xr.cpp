@@ -1,0 +1,636 @@
+// Wipeout Pure VR: the headset side of the Quest build. An OpenXR session on
+// the renderer's own Vulkan device (PortableKit's host/gpu/xr_bridge.hpp):
+// the renderer draws each frame, the port's menu included, into a panel
+// image, which is copied into an OpenXR swapchain and shown as a large
+// curved screen in front of the player. The Touch controllers become the
+// gamepad the port already understands, so every button stays rebindable in
+// its Controls tab.
+//
+// Stage 1 of the port (README-QUEST.md): the whole game on the screen; the
+// stereo race view follows.
+//
+// Default mapping (the gamepad buttons in SDL's names, then the PSP button
+// the port's gamepad mapping makes of them):
+//   left stick          steer                     left stick
+//   right trigger       thrust / confirm          south      -> cross
+//   left trigger        use pickup (fire)         west       -> square
+//   grips               airbrakes                 shoulders  -> L / R
+//   A                   confirm                   south      -> cross
+//   B                   back / look behind        north      -> triangle
+//   X                   absorb pickup             east       -> circle
+//   Y                   change view               back       -> select
+//   left stick click    pause                     start
+//   menu button         pause                     start
+//   right stick         menu cursor               D-pad
+//   both stick clicks   the port's own menu       L3 + R3
+
+#include "gpu/xr_bridge.hpp"
+
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_system.h>
+
+#include <android/log.h>
+#include <jni.h>
+
+#define XR_USE_PLATFORM_ANDROID
+#define XR_USE_GRAPHICS_API_VULKAN
+#include <openxr/openxr.h>
+#include <openxr/openxr_platform.h>
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cmath>
+#include <cstdarg>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
+
+namespace {
+
+// The panel the renderer draws at: the PSP's 480x272 four times over.
+constexpr std::uint32_t kPanelWidth = 1920u;
+constexpr std::uint32_t kPanelHeight = 1088u;
+// The screen: part of a cylinder around the player, its axis through the
+// head at start. 2.2 m away and 1.3 rad (75 degrees) wide.
+constexpr float kScreenRadius = 2.2f;
+constexpr float kScreenAngle = 1.3f;
+
+void vlog(const char *format, va_list args) {
+    va_list copy;
+    va_copy(copy, args);
+    __android_log_vprint(ANDROID_LOG_INFO, "PureVR", format, args);
+    std::printf("[vr] ");
+    std::vprintf(format, copy);
+    std::printf("\n");
+    std::fflush(stdout);
+    va_end(copy);
+}
+
+void log(const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    vlog(format, args);
+    va_end(args);
+}
+
+bool ok(XrResult result, const char *what) {
+    if (XR_SUCCEEDED(result)) return true;
+    log("%s failed: %d", what, static_cast<int>(result));
+    return false;
+}
+
+std::vector<std::string> split(const std::string &text) {
+    std::vector<std::string> out;
+    std::size_t at = 0;
+    while (at < text.size()) {
+        const std::size_t end = text.find(' ', at);
+        const std::string word = text.substr(at, end == std::string::npos ? std::string::npos : end - at);
+        if (!word.empty()) out.push_back(word);
+        if (end == std::string::npos) break;
+        at = end + 1;
+    }
+    return out;
+}
+
+// A digital button made from an analog value, with hysteresis so a half
+// pulled trigger does not flicker.
+struct Latch {
+    bool on{};
+    bool update(float value, float press = 0.45f, float release = 0.25f) {
+        on = on ? value > release : value > press;
+        return on;
+    }
+};
+
+class QuestXr final : public portablekit::gpu::xr::Bridge {
+public:
+    bool prepare() override;
+    void instance_extensions(std::vector<const char *> &extensions) override;
+    VkPhysicalDevice physical_device(VkInstance instance) override;
+    void device_extensions(VkPhysicalDevice physical_device, std::vector<const char *> &extensions) override;
+    bool start(VkInstance instance, VkPhysicalDevice physical_device, VkDevice device, std::uint32_t queue_family,
+               std::uint32_t queue_index) override;
+    [[nodiscard]] VkExtent2D panel_extent() const override { return {kPanelWidth, kPanelHeight}; }
+    bool begin_frame() override;
+    void record_present(VkCommandBuffer commands, VkImage image, VkImageLayout layout, VkExtent2D extent) override;
+    void end_frame() override;
+    [[nodiscard]] bool button(int button) const override {
+        return button >= 0 && button < 32 && (buttons_.load(std::memory_order_relaxed) & (1u << button)) != 0u;
+    }
+    [[nodiscard]] float axis(int axis) const override {
+        return axis >= 0 && axis < static_cast<int>(axes_.size()) ? axes_[static_cast<std::size_t>(axis)].load(
+                                                                        std::memory_order_relaxed)
+                                                                  : 0.0f;
+    }
+
+private:
+    bool has_extension(const char *name) const {
+        return std::find(available_.begin(), available_.end(), name) != available_.end();
+    }
+    void poll_events();
+    bool create_actions();
+    void read_input();
+    XrAction make_action(const char *name, XrActionType type);
+    XrPath path(const char *text) const {
+        XrPath result = XR_NULL_PATH;
+        xrStringToPath(instance_, text, &result);
+        return result;
+    }
+    bool held(XrAction action) const;
+    float value(XrAction action) const;
+    XrVector2f stick(XrAction vector, XrAction x, XrAction y) const;
+
+    XrInstance instance_{XR_NULL_HANDLE};
+    XrSystemId system_{XR_NULL_SYSTEM_ID};
+    XrSession session_{XR_NULL_HANDLE};
+    XrSpace local_{XR_NULL_HANDLE};
+    XrSwapchain swapchain_{XR_NULL_HANDLE};
+    std::vector<XrSwapchainImageVulkanKHR> images_;
+    std::int64_t swapchain_format_{};
+    XrSessionState state_{XR_SESSION_STATE_UNKNOWN};
+    bool running_{};
+    bool frame_begun_{};
+    bool image_acquired_{};
+    XrFrameState frame_{XR_TYPE_FRAME_STATE};
+    std::vector<std::string> available_;
+    std::vector<std::string> instance_extensions_;
+    std::vector<std::string> device_extensions_;
+    bool cylinder_{};
+    bool pico_{};
+
+    PFN_xrGetVulkanInstanceExtensionsKHR get_instance_extensions_{};
+    PFN_xrGetVulkanDeviceExtensionsKHR get_device_extensions_{};
+    PFN_xrGetVulkanGraphicsDeviceKHR get_graphics_device_{};
+    PFN_xrGetVulkanGraphicsRequirementsKHR get_graphics_requirements_{};
+
+    XrActionSet actions_{XR_NULL_HANDLE};
+    XrAction a_{}, b_{}, x_{}, y_{}, menu_{}, left_click_{}, right_click_{};
+    XrAction left_trigger_{}, right_trigger_{}, left_grip_{}, right_grip_{};
+    XrAction left_stick_{}, right_stick_{}, left_x_{}, left_y_{}, right_x_{}, right_y_{};
+    Latch thrust_, fire_, brake_left_, brake_right_;
+    std::array<Latch, 4> dpad_{};
+    std::uint64_t input_frames_{};
+
+    std::atomic<std::uint32_t> buttons_{};
+    std::array<std::atomic<float>, SDL_GAMEPAD_AXIS_COUNT> axes_{};
+};
+
+bool QuestXr::prepare() {
+    PFN_xrInitializeLoaderKHR initialize = nullptr;
+    if (!ok(xrGetInstanceProcAddr(XR_NULL_HANDLE, "xrInitializeLoaderKHR",
+                                  reinterpret_cast<PFN_xrVoidFunction *>(&initialize)),
+            "xrGetInstanceProcAddr(xrInitializeLoaderKHR)") ||
+        initialize == nullptr)
+        return false;
+    auto *env = static_cast<JNIEnv *>(SDL_GetAndroidJNIEnv());
+    auto activity_local = static_cast<jobject>(SDL_GetAndroidActivity());
+    if (env == nullptr || activity_local == nullptr) {
+        log("no JNI environment or activity: %s", SDL_GetError());
+        return false;
+    }
+    JavaVM *vm = nullptr;
+    env->GetJavaVM(&vm);
+    jobject activity = env->NewGlobalRef(activity_local);
+    env->DeleteLocalRef(activity_local);
+
+    XrLoaderInitInfoAndroidKHR loader{XR_TYPE_LOADER_INIT_INFO_ANDROID_KHR};
+    loader.applicationVM = vm;
+    loader.applicationContext = activity;
+    if (!ok(initialize(reinterpret_cast<const XrLoaderInitInfoBaseHeaderKHR *>(&loader)), "xrInitializeLoaderKHR"))
+        return false;
+
+    std::uint32_t count = 0;
+    if (!ok(xrEnumerateInstanceExtensionProperties(nullptr, 0, &count, nullptr), "xrEnumerateInstanceExtensionProperties"))
+        return false;
+    std::vector<XrExtensionProperties> properties(count, {XR_TYPE_EXTENSION_PROPERTIES});
+    xrEnumerateInstanceExtensionProperties(nullptr, count, &count, properties.data());
+    for (const XrExtensionProperties &p : properties) available_.emplace_back(p.extensionName);
+    if (!has_extension(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME)) {
+        log("the OpenXR runtime has no %s", XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
+        return false;
+    }
+    std::vector<const char *> enabled{XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
+                                      XR_KHR_VULKAN_ENABLE_EXTENSION_NAME};
+    cylinder_ = has_extension(XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME);
+    if (cylinder_) enabled.push_back(XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME);
+    pico_ = has_extension(XR_BD_CONTROLLER_INTERACTION_EXTENSION_NAME);
+    if (pico_) enabled.push_back(XR_BD_CONTROLLER_INTERACTION_EXTENSION_NAME);
+
+    XrInstanceCreateInfoAndroidKHR android{XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR};
+    android.applicationVM = vm;
+    android.applicationActivity = activity;
+    XrInstanceCreateInfo create{XR_TYPE_INSTANCE_CREATE_INFO};
+    create.next = &android;
+    std::strncpy(create.applicationInfo.applicationName, "Wipeout Pure VR", XR_MAX_APPLICATION_NAME_SIZE - 1);
+    std::strncpy(create.applicationInfo.engineName, "PortableKit", XR_MAX_ENGINE_NAME_SIZE - 1);
+    create.applicationInfo.applicationVersion = 1;
+    create.applicationInfo.apiVersion = XR_API_VERSION_1_0;
+    create.enabledExtensionCount = static_cast<std::uint32_t>(enabled.size());
+    create.enabledExtensionNames = enabled.data();
+    if (!ok(xrCreateInstance(&create, &instance_), "xrCreateInstance")) return false;
+
+    XrSystemGetInfo system{XR_TYPE_SYSTEM_GET_INFO};
+    system.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
+    if (!ok(xrGetSystem(instance_, &system, &system_), "xrGetSystem")) return false;
+    const auto get = [this](const char *name, auto &function) {
+        return ok(xrGetInstanceProcAddr(instance_, name, reinterpret_cast<PFN_xrVoidFunction *>(&function)), name) &&
+               function != nullptr;
+    };
+    if (!get("xrGetVulkanInstanceExtensionsKHR", get_instance_extensions_) ||
+        !get("xrGetVulkanDeviceExtensionsKHR", get_device_extensions_) ||
+        !get("xrGetVulkanGraphicsDeviceKHR", get_graphics_device_) ||
+        !get("xrGetVulkanGraphicsRequirementsKHR", get_graphics_requirements_))
+        return false;
+    XrInstanceProperties instance_properties{XR_TYPE_INSTANCE_PROPERTIES};
+    xrGetInstanceProperties(instance_, &instance_properties);
+    log("OpenXR runtime %s %u.%u.%u, cylinder layer %s, PICO controllers %s", instance_properties.runtimeName,
+        XR_VERSION_MAJOR(instance_properties.runtimeVersion), XR_VERSION_MINOR(instance_properties.runtimeVersion),
+        XR_VERSION_PATCH(instance_properties.runtimeVersion), cylinder_ ? "yes" : "no", pico_ ? "yes" : "no");
+    return true;
+}
+
+void QuestXr::instance_extensions(std::vector<const char *> &extensions) {
+    std::uint32_t size = 0;
+    get_instance_extensions_(instance_, system_, 0, &size, nullptr);
+    std::string text(size, '\0');
+    get_instance_extensions_(instance_, system_, size, &size, text.data());
+    text.resize(std::strlen(text.c_str()));
+    instance_extensions_ = split(text);
+    for (const std::string &name : instance_extensions_) extensions.push_back(name.c_str());
+    log("Vulkan instance extensions for the runtime: %s", text.c_str());
+}
+
+VkPhysicalDevice QuestXr::physical_device(VkInstance instance) {
+    XrGraphicsRequirementsVulkanKHR requirements{XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR};
+    get_graphics_requirements_(instance_, system_, &requirements);
+    VkPhysicalDevice device = VK_NULL_HANDLE;
+    if (!ok(get_graphics_device_(instance_, system_, instance, &device), "xrGetVulkanGraphicsDeviceKHR"))
+        return VK_NULL_HANDLE;
+    return device;
+}
+
+void QuestXr::device_extensions(VkPhysicalDevice, std::vector<const char *> &extensions) {
+    std::uint32_t size = 0;
+    get_device_extensions_(instance_, system_, 0, &size, nullptr);
+    std::string text(size, '\0');
+    get_device_extensions_(instance_, system_, size, &size, text.data());
+    text.resize(std::strlen(text.c_str()));
+    device_extensions_ = split(text);
+    for (const std::string &name : device_extensions_) extensions.push_back(name.c_str());
+    log("Vulkan device extensions for the runtime: %s", text.c_str());
+}
+
+bool QuestXr::start(VkInstance instance, VkPhysicalDevice physical_device, VkDevice device,
+                    std::uint32_t queue_family, std::uint32_t queue_index) {
+    XrGraphicsBindingVulkanKHR binding{XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR};
+    binding.instance = instance;
+    binding.physicalDevice = physical_device;
+    binding.device = device;
+    binding.queueFamilyIndex = queue_family;
+    binding.queueIndex = queue_index;
+    XrSessionCreateInfo session{XR_TYPE_SESSION_CREATE_INFO};
+    session.next = &binding;
+    session.systemId = system_;
+    if (!ok(xrCreateSession(instance_, &session, &session_), "xrCreateSession")) return false;
+
+    XrReferenceSpaceCreateInfo space{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+    space.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+    space.poseInReferenceSpace.orientation.w = 1.0f;
+    if (!ok(xrCreateReferenceSpace(session_, &space, &local_), "xrCreateReferenceSpace(LOCAL)")) return false;
+
+    // The game's colours are gamma-encoded already: an sRGB swapchain takes
+    // them byte for byte (the copy does not convert), and the compositor
+    // decodes them as it should.
+    std::uint32_t count = 0;
+    xrEnumerateSwapchainFormats(session_, 0, &count, nullptr);
+    std::vector<std::int64_t> formats(count);
+    xrEnumerateSwapchainFormats(session_, count, &count, formats.data());
+    for (std::int64_t format : formats)
+        if (format == VK_FORMAT_R8G8B8A8_SRGB) swapchain_format_ = format;
+    if (swapchain_format_ == 0)
+        for (std::int64_t format : formats)
+            if (format == VK_FORMAT_R8G8B8A8_UNORM) swapchain_format_ = format;
+    if (swapchain_format_ == 0) {
+        log("the runtime offers neither R8G8B8A8_SRGB nor _UNORM swapchains");
+        return false;
+    }
+    XrSwapchainCreateInfo create{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    create.usageFlags = XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+    create.format = swapchain_format_;
+    create.sampleCount = 1;
+    create.width = kPanelWidth;
+    create.height = kPanelHeight;
+    create.faceCount = 1;
+    create.arraySize = 1;
+    create.mipCount = 1;
+    if (!ok(xrCreateSwapchain(session_, &create, &swapchain_), "xrCreateSwapchain")) return false;
+    xrEnumerateSwapchainImages(swapchain_, 0, &count, nullptr);
+    images_.assign(count, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+    xrEnumerateSwapchainImages(swapchain_, count, &count,
+                               reinterpret_cast<XrSwapchainImageBaseHeader *>(images_.data()));
+    log("screen swapchain %ux%u, format %lld, %u images", kPanelWidth, kPanelHeight,
+        static_cast<long long>(swapchain_format_), count);
+    return create_actions();
+}
+
+XrAction QuestXr::make_action(const char *name, XrActionType type) {
+    XrActionCreateInfo info{XR_TYPE_ACTION_CREATE_INFO};
+    info.actionType = type;
+    std::strncpy(info.actionName, name, XR_MAX_ACTION_NAME_SIZE - 1);
+    std::string localized(name);
+    std::replace(localized.begin(), localized.end(), '_', ' ');
+    std::strncpy(info.localizedActionName, localized.c_str(), XR_MAX_LOCALIZED_ACTION_NAME_SIZE - 1);
+    XrAction action = XR_NULL_HANDLE;
+    ok(xrCreateAction(actions_, &info, &action), name);
+    return action;
+}
+
+bool QuestXr::create_actions() {
+    XrActionSetCreateInfo set{XR_TYPE_ACTION_SET_CREATE_INFO};
+    std::strcpy(set.actionSetName, "racing");
+    std::strcpy(set.localizedActionSetName, "Racing");
+    if (!ok(xrCreateActionSet(instance_, &set, &actions_), "xrCreateActionSet")) return false;
+    a_ = make_action("button_a", XR_ACTION_TYPE_BOOLEAN_INPUT);
+    b_ = make_action("button_b", XR_ACTION_TYPE_BOOLEAN_INPUT);
+    x_ = make_action("button_x", XR_ACTION_TYPE_BOOLEAN_INPUT);
+    y_ = make_action("button_y", XR_ACTION_TYPE_BOOLEAN_INPUT);
+    menu_ = make_action("menu", XR_ACTION_TYPE_BOOLEAN_INPUT);
+    left_click_ = make_action("left_stick_click", XR_ACTION_TYPE_BOOLEAN_INPUT);
+    right_click_ = make_action("right_stick_click", XR_ACTION_TYPE_BOOLEAN_INPUT);
+    left_trigger_ = make_action("left_trigger", XR_ACTION_TYPE_FLOAT_INPUT);
+    right_trigger_ = make_action("right_trigger", XR_ACTION_TYPE_FLOAT_INPUT);
+    left_grip_ = make_action("left_grip", XR_ACTION_TYPE_FLOAT_INPUT);
+    right_grip_ = make_action("right_grip", XR_ACTION_TYPE_FLOAT_INPUT);
+    left_stick_ = make_action("left_stick", XR_ACTION_TYPE_VECTOR2F_INPUT);
+    right_stick_ = make_action("right_stick", XR_ACTION_TYPE_VECTOR2F_INPUT);
+    // The stick's components as well: on Quest the vector binding alone can
+    // stay at 0,0.
+    left_x_ = make_action("left_stick_x", XR_ACTION_TYPE_FLOAT_INPUT);
+    left_y_ = make_action("left_stick_y", XR_ACTION_TYPE_FLOAT_INPUT);
+    right_x_ = make_action("right_stick_x", XR_ACTION_TYPE_FLOAT_INPUT);
+    right_y_ = make_action("right_stick_y", XR_ACTION_TYPE_FLOAT_INPUT);
+
+    const auto suggest = [this](const char *profile) {
+        const std::vector<std::pair<XrAction, const char *>> pairs{
+            {a_, "/user/hand/right/input/a/click"},
+            {b_, "/user/hand/right/input/b/click"},
+            {x_, "/user/hand/left/input/x/click"},
+            {y_, "/user/hand/left/input/y/click"},
+            {menu_, "/user/hand/left/input/menu/click"},
+            {left_click_, "/user/hand/left/input/thumbstick/click"},
+            {right_click_, "/user/hand/right/input/thumbstick/click"},
+            {left_trigger_, "/user/hand/left/input/trigger/value"},
+            {right_trigger_, "/user/hand/right/input/trigger/value"},
+            {left_grip_, "/user/hand/left/input/squeeze/value"},
+            {right_grip_, "/user/hand/right/input/squeeze/value"},
+            {left_stick_, "/user/hand/left/input/thumbstick"},
+            {right_stick_, "/user/hand/right/input/thumbstick"},
+            {left_x_, "/user/hand/left/input/thumbstick/x"},
+            {left_y_, "/user/hand/left/input/thumbstick/y"},
+            {right_x_, "/user/hand/right/input/thumbstick/x"},
+            {right_y_, "/user/hand/right/input/thumbstick/y"},
+        };
+        std::vector<XrActionSuggestedBinding> bindings;
+        for (const auto &[action, where] : pairs) bindings.push_back({action, path(where)});
+        XrInteractionProfileSuggestedBinding suggested{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+        suggested.interactionProfile = path(profile);
+        suggested.countSuggestedBindings = static_cast<std::uint32_t>(bindings.size());
+        suggested.suggestedBindings = bindings.data();
+        return ok(xrSuggestInteractionProfileBindings(instance_, &suggested), profile);
+    };
+    if (!suggest("/interaction_profiles/oculus/touch_controller")) return false;
+    if (pico_) suggest("/interaction_profiles/bytedance/pico4_controller");
+
+    XrSessionActionSetsAttachInfo attach{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
+    attach.countActionSets = 1;
+    attach.actionSets = &actions_;
+    return ok(xrAttachSessionActionSets(session_, &attach), "xrAttachSessionActionSets");
+}
+
+bool QuestXr::held(XrAction action) const {
+    XrActionStateGetInfo info{XR_TYPE_ACTION_STATE_GET_INFO};
+    info.action = action;
+    XrActionStateBoolean state{XR_TYPE_ACTION_STATE_BOOLEAN};
+    return XR_SUCCEEDED(xrGetActionStateBoolean(session_, &info, &state)) && state.isActive && state.currentState;
+}
+
+float QuestXr::value(XrAction action) const {
+    XrActionStateGetInfo info{XR_TYPE_ACTION_STATE_GET_INFO};
+    info.action = action;
+    XrActionStateFloat state{XR_TYPE_ACTION_STATE_FLOAT};
+    if (XR_FAILED(xrGetActionStateFloat(session_, &info, &state)) || !state.isActive) return 0.0f;
+    return state.currentState;
+}
+
+XrVector2f QuestXr::stick(XrAction vector, XrAction x, XrAction y) const {
+    XrActionStateGetInfo info{XR_TYPE_ACTION_STATE_GET_INFO};
+    info.action = vector;
+    XrActionStateVector2f state{XR_TYPE_ACTION_STATE_VECTOR2F};
+    XrVector2f result{};
+    if (XR_SUCCEEDED(xrGetActionStateVector2f(session_, &info, &state)) && state.isActive)
+        result = state.currentState;
+    if (result.x == 0.0f && result.y == 0.0f) result = {value(x), value(y)};
+    return result;
+}
+
+void QuestXr::read_input() {
+    std::uint32_t bits = 0u;
+    std::array<float, SDL_GAMEPAD_AXIS_COUNT> axes{};
+    if (state_ == XR_SESSION_STATE_FOCUSED) {
+        XrActiveActionSet active{actions_, XR_NULL_PATH};
+        XrActionsSyncInfo sync{XR_TYPE_ACTIONS_SYNC_INFO};
+        sync.countActiveActionSets = 1;
+        sync.activeActionSets = &active;
+        if (XR_SUCCEEDED(xrSyncActions(session_, &sync))) {
+            const auto set = [&bits](int button, bool on) {
+                if (on) bits |= 1u << button;
+            };
+            const bool left_click = held(left_click_);
+            const bool right_click = held(right_click_);
+            set(SDL_GAMEPAD_BUTTON_SOUTH, held(a_) || thrust_.update(value(right_trigger_)));
+            set(SDL_GAMEPAD_BUTTON_WEST, fire_.update(value(left_trigger_)));
+            set(SDL_GAMEPAD_BUTTON_NORTH, held(b_));
+            set(SDL_GAMEPAD_BUTTON_EAST, held(x_));
+            set(SDL_GAMEPAD_BUTTON_BACK, held(y_));
+            set(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, brake_left_.update(value(left_grip_), 0.5f, 0.3f));
+            set(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, brake_right_.update(value(right_grip_), 0.5f, 0.3f));
+            // Both stick clicks open the port's own menu (L3 + R3); the left
+            // one alone pauses, as does the menu button where the system
+            // leaves it to the app.
+            if (left_click && right_click) {
+                set(SDL_GAMEPAD_BUTTON_LEFT_STICK, true);
+                set(SDL_GAMEPAD_BUTTON_RIGHT_STICK, true);
+            } else {
+                set(SDL_GAMEPAD_BUTTON_START, left_click);
+            }
+            if (held(menu_)) set(SDL_GAMEPAD_BUTTON_START, true);
+            const XrVector2f left = stick(left_stick_, left_x_, left_y_);
+            const XrVector2f right = stick(right_stick_, right_x_, right_y_);
+            axes[SDL_GAMEPAD_AXIS_LEFTX] = std::clamp(left.x, -1.0f, 1.0f);
+            axes[SDL_GAMEPAD_AXIS_LEFTY] = std::clamp(-left.y, -1.0f, 1.0f);  // SDL: down is positive
+            set(SDL_GAMEPAD_BUTTON_DPAD_UP, dpad_[0].update(right.y, 0.6f, 0.4f));
+            set(SDL_GAMEPAD_BUTTON_DPAD_DOWN, dpad_[1].update(-right.y, 0.6f, 0.4f));
+            set(SDL_GAMEPAD_BUTTON_DPAD_LEFT, dpad_[2].update(-right.x, 0.6f, 0.4f));
+            set(SDL_GAMEPAD_BUTTON_DPAD_RIGHT, dpad_[3].update(right.x, 0.6f, 0.4f));
+            // Every two seconds while something is held: what the controllers send.
+            if ((++input_frames_ % 144u) == 0u && (bits != 0u || left.x != 0.0f || left.y != 0.0f))
+                log("input: buttons 0x%x, left stick %.2f %.2f, right stick %.2f %.2f", bits, left.x, left.y,
+                    right.x, right.y);
+        }
+    }
+    buttons_.store(bits, std::memory_order_relaxed);
+    for (std::size_t i = 0; i < axes.size(); ++i) axes_[i].store(axes[i], std::memory_order_relaxed);
+}
+
+void QuestXr::poll_events() {
+    XrEventDataBuffer event{XR_TYPE_EVENT_DATA_BUFFER};
+    while (xrPollEvent(instance_, &event) == XR_SUCCESS) {
+        if (event.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
+            const auto &changed = reinterpret_cast<const XrEventDataSessionStateChanged &>(event);
+            state_ = changed.state;
+            log("session state %d", static_cast<int>(state_));
+            if (state_ == XR_SESSION_STATE_READY) {
+                XrSessionBeginInfo begin{XR_TYPE_SESSION_BEGIN_INFO};
+                begin.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+                running_ = ok(xrBeginSession(session_, &begin), "xrBeginSession");
+            } else if (state_ == XR_SESSION_STATE_STOPPING) {
+                ok(xrEndSession(session_), "xrEndSession");
+                running_ = false;
+            } else if (state_ == XR_SESSION_STATE_EXITING || state_ == XR_SESSION_STATE_LOSS_PENDING) {
+                running_ = false;
+                SDL_Event quit{};
+                quit.type = SDL_EVENT_QUIT;
+                SDL_PushEvent(&quit);
+            }
+        } else if (event.type == XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED) {
+            log("interaction profile changed");
+        } else if (event.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
+            running_ = false;
+        }
+        event = {XR_TYPE_EVENT_DATA_BUFFER};
+    }
+}
+
+bool QuestXr::begin_frame() {
+    poll_events();
+    frame_begun_ = false;
+    image_acquired_ = false;
+    if (!running_) {
+        read_input();
+        return false;
+    }
+    frame_ = {XR_TYPE_FRAME_STATE};
+    XrFrameWaitInfo wait{XR_TYPE_FRAME_WAIT_INFO};
+    if (!ok(xrWaitFrame(session_, &wait, &frame_), "xrWaitFrame")) return false;
+    XrFrameBeginInfo begin{XR_TYPE_FRAME_BEGIN_INFO};
+    if (!ok(xrBeginFrame(session_, &begin), "xrBeginFrame")) return false;
+    frame_begun_ = true;
+    read_input();
+    return frame_.shouldRender == XR_TRUE;
+}
+
+void QuestXr::record_present(VkCommandBuffer commands, VkImage image, VkImageLayout layout, VkExtent2D extent) {
+    if (!frame_begun_ || frame_.shouldRender != XR_TRUE) return;
+    std::uint32_t index = 0;
+    XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    if (!ok(xrAcquireSwapchainImage(swapchain_, &acquire, &index), "xrAcquireSwapchainImage")) return;
+    XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wait.timeout = XR_INFINITE_DURATION;
+    if (!ok(xrWaitSwapchainImage(swapchain_, &wait), "xrWaitSwapchainImage")) {
+        XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        xrReleaseSwapchainImage(swapchain_, &release);
+        return;
+    }
+    image_acquired_ = true;
+    VkImage target = images_[index].image;
+
+    VkImageMemoryBarrier barriers[2]{};
+    barriers[0] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barriers[0].oldLayout = layout;
+    barriers[0].newLayout = layout;
+    barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[0].image = image;
+    barriers[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u};
+    barriers[1] = barriers[0];
+    barriers[1].srcAccessMask = 0u;
+    barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barriers[1].image = target;
+    vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0u, 0u, nullptr, 0u, nullptr, 2u, barriers);
+    VkImageCopy copy{};
+    copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u};
+    copy.dstSubresource = copy.srcSubresource;
+    copy.extent = {std::min(extent.width, kPanelWidth), std::min(extent.height, kPanelHeight), 1u};
+    vkCmdCopyImage(commands, image, layout, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1u, &copy);
+    VkImageMemoryBarrier done = barriers[1];
+    done.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    done.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    done.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    done.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0u,
+                         0u, nullptr, 0u, nullptr, 1u, &done);
+}
+
+void QuestXr::end_frame() {
+    if (image_acquired_) {
+        XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        ok(xrReleaseSwapchainImage(swapchain_, &release), "xrReleaseSwapchainImage");
+    }
+    if (!frame_begun_) return;
+    XrCompositionLayerCylinderKHR cylinder{XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR};
+    XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
+    const XrCompositionLayerBaseHeader *layers[1]{};
+    std::uint32_t layer_count = 0;
+    if (image_acquired_) {
+        const XrSwapchainSubImage sub{swapchain_, {{0, 0}, {static_cast<std::int32_t>(kPanelWidth),
+                                                            static_cast<std::int32_t>(kPanelHeight)}}, 0};
+        const float aspect = static_cast<float>(kPanelWidth) / static_cast<float>(kPanelHeight);
+        if (cylinder_) {
+            cylinder.space = local_;
+            cylinder.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+            cylinder.subImage = sub;
+            cylinder.pose.orientation.w = 1.0f;
+            cylinder.radius = kScreenRadius;
+            cylinder.centralAngle = kScreenAngle;
+            cylinder.aspectRatio = aspect;
+            layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&cylinder);
+        } else {
+            const float width = kScreenRadius * kScreenAngle;
+            quad.space = local_;
+            quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+            quad.subImage = sub;
+            quad.pose.orientation.w = 1.0f;
+            quad.pose.position.z = -kScreenRadius;
+            quad.size = {width, width / aspect};
+            layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&quad);
+        }
+    }
+    XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};
+    end.displayTime = frame_.predictedDisplayTime;
+    end.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    end.layerCount = layer_count;
+    end.layers = layers;
+    ok(xrEndFrame(session_, &end), "xrEndFrame");
+    frame_begun_ = false;
+    image_acquired_ = false;
+}
+
+QuestXr &quest_xr() {
+    static QuestXr bridge;
+    return bridge;
+}
+
+// Registered when libmain.so loads, before the renderer starts.
+const bool kRegistered = [] {
+    portablekit::gpu::xr::set_bridge(&quest_xr());
+    return true;
+}();
+
+} // namespace
