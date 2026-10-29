@@ -164,12 +164,36 @@ void VulkanRenderer::Impl::record_stereo(VkCommandBuffer commands) {
     }
     xr::StereoFrame stereo{};
     if (!xr::bridge()->stereo_begin(stereo)) return;
+    // The eye passes' GPU time: this slot's last pair has finished (begin_frame waited for its fence).
+    if (eye_timer == VK_NULL_HANDLE && gpu_timer != VK_NULL_HANDLE) {
+        VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        info.queryCount = 2u * kMaxSlots;
+        if (vkCreateQueryPool(device, &info, nullptr, &eye_timer) != VK_SUCCESS) eye_timer = VK_NULL_HANDLE;
+    }
+    if (eye_timer != VK_NULL_HANDLE && eye_timed[slot]) {
+        std::array<std::uint64_t, 2> ticks{};
+        if (vkGetQueryPoolResults(device, eye_timer, slot * 2u, 2u, sizeof(ticks), ticks.data(), sizeof(std::uint64_t),
+                                  VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+            eye_gpu_ms += static_cast<double>((ticks[1] - ticks[0]) & gpu_timer_mask) * gpu_timer_ns_per_tick / 1.0e6;
+            ++eye_gpu_samples;
+        }
+        eye_timed[slot] = false;
+    }
+    if (eye_timer != VK_NULL_HANDLE) {
+        vkCmdResetQueryPool(commands, eye_timer, slot * 2u, 2u);
+        vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, eye_timer, slot * 2u);
+    }
     std::array<VkImage, 2> images{};
     for (std::uint32_t eye = 0; eye < 2u; ++eye) {
         replay_eye(commands, eye_targets[eye], stereo, eye);
         transition(commands, eye_targets[eye].color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         images[eye] = eye_targets[eye].color;
+    }
+    if (eye_timer != VK_NULL_HANDLE) {
+        vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, eye_timer, slot * 2u + 1u);
+        eye_timed[slot] = true;
     }
     xr::bridge()->record_stereo(commands, images, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, extent);
     for (const Target &target : eye_targets)
@@ -504,6 +528,11 @@ void VulkanRenderer::Impl::replay_eye(VkCommandBuffer commands, Target &target, 
     // Every five seconds or so: what the eyes drew, and the numbers that say
     // whether the game's eye space was read right and how big its units are.
     if (eye == 0u && stereo_frames++ % 360u == 0u) {
+        if (eye_gpu_samples != 0u)
+            std::printf("[vr] GPU time of the two eyes: %.2f ms a frame (%u frames)\n",
+                        eye_gpu_ms / static_cast<double>(eye_gpu_samples), eye_gpu_samples);
+        eye_gpu_ms = 0.0;
+        eye_gpu_samples = 0u;
         std::printf("[vr] stereo: %u 3D, %u full-screen (%u glow left out), %u sprite and %u flat draw calls, eye %ux%u, nearest 3D object %.2f units away, "
                     "%.3g units a metre, interface %.0f..%.0f x %.0f..%.0f\n",
                     perspective, fullscreen, glows, sprites, flat, target.extent.width, target.extent.height, static_cast<double>(nearest),

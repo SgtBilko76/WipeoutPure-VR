@@ -42,7 +42,7 @@ index d9882e8..de4af9d 100644
          int enables = int(push.viewport.w + 0.5);
          if ((enables & 2) != 0) light_vertex(frag_color, frag_specular);
 diff --git a/host/gpu/vulkan_renderer.cpp b/host/gpu/vulkan_renderer.cpp
-index ef4fcb8..23e6903 100644
+index ef4fcb8..4f6efdd 100644
 --- a/host/gpu/vulkan_renderer.cpp
 +++ b/host/gpu/vulkan_renderer.cpp
 @@ -5,6 +5,7 @@
@@ -53,7 +53,7 @@ index ef4fcb8..23e6903 100644
  #include "frame_pacing.hpp"
  #include "replacement_textures.hpp"
  #include "texture_decode.hpp"
-@@ -1732,6 +1733,14 @@ struct VulkanRenderer::Impl : host::SdlPad {
+@@ -1732,6 +1733,18 @@ struct VulkanRenderer::Impl : host::SdlPad {
      bool poll_presents(std::chrono::steady_clock::time_point now, bool account, bool idle);
      bool present_between(const pacing::PresentClock::Present &present, bool account);
      void replay(VkCommandBuffer commands, std::uint32_t slot, float t);
@@ -61,6 +61,10 @@ index ef4fcb8..23e6903 100644
 +    std::array<Target, 2> eye_targets{};
 +    bool stereo_ready{};  // newer_frame is the frame being presented, recorded for the eyes
 +    std::uint64_t stereo_frames{};
++    VkQueryPool eye_timer{};  // the eye passes' GPU time, a pair per frame slot
++    std::array<bool, kMaxSlots> eye_timed{};
++    double eye_gpu_ms{};
++    std::uint32_t eye_gpu_samples{};
 +    [[nodiscard]] bool stereo_wanted() const;
 +    void finish_stereo_frame(std::uint32_t displayed);
 +    void record_stereo(VkCommandBuffer commands);
@@ -68,7 +72,7 @@ index ef4fcb8..23e6903 100644
      void report_interpolation();
      void reset_interpolation();
      void destroy_interpolation_targets();
-@@ -1874,6 +1883,11 @@ struct VulkanRenderer::Impl : host::SdlPad {
+@@ -1874,6 +1887,11 @@ struct VulkanRenderer::Impl : host::SdlPad {
      bool recording{};
      bool quit{};
      bool ready{};
@@ -80,7 +84,7 @@ index ef4fcb8..23e6903 100644
      std::uint64_t frames{};
      std::uint64_t draws{};
  
-@@ -1997,6 +2011,7 @@ struct VulkanRenderer::Impl : host::SdlPad {
+@@ -1997,6 +2015,7 @@ struct VulkanRenderer::Impl : host::SdlPad {
      }
      [[nodiscard]] VkPresentModeKHR wanted_present_mode() const;
      bool create_swapchain(std::string &error);
@@ -88,7 +92,7 @@ index ef4fcb8..23e6903 100644
      void destroy_swapchain_views();
      void recreate_swapchain();
  #if defined(__ANDROID__)
-@@ -2029,6 +2044,7 @@ struct VulkanRenderer::Impl : host::SdlPad {
+@@ -2029,6 +2048,7 @@ struct VulkanRenderer::Impl : host::SdlPad {
      // frame. So the swapchain is rebuilt only when the display's transform or
      // the window's size really changed: once per turn of the phone.
      void check_swapchain() {
@@ -96,7 +100,7 @@ index ef4fcb8..23e6903 100644
          if (!std::exchange(swapchain_check, false) || swapchain == VK_NULL_HANDLE) return;
  #if defined(__ANDROID__)
          VkSurfaceCapabilitiesKHR capabilities{};
-@@ -2337,6 +2353,21 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
+@@ -2337,6 +2357,21 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
          if (std::strcmp(extension.extensionName, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) == 0)
              portability_enumeration = true;
      if (portability_enumeration) extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
@@ -118,7 +122,7 @@ index ef4fcb8..23e6903 100644
  
      VkApplicationInfo application{VK_STRUCTURE_TYPE_APPLICATION_INFO};
      application.pApplicationName = portablekit::game().app_name;
-@@ -2377,6 +2408,9 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
+@@ -2377,6 +2412,9 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
          }
      }
  
@@ -128,7 +132,7 @@ index ef4fcb8..23e6903 100644
      std::uint32_t family_count = 0u;
      vkGetPhysicalDeviceQueueFamilyProperties(impl.physical_device, &family_count, nullptr);
      std::vector<VkQueueFamilyProperties> families(family_count);
-@@ -2411,14 +2445,20 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
+@@ -2411,14 +2449,20 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
              impl.breadcrumbs.available = true;
          }
      }
@@ -152,7 +156,7 @@ index ef4fcb8..23e6903 100644
      // <prefix>_CHECK_GPU_DECODE: the check build of the raw vertex shader
      // writes what it decoded to a storage buffer.
      VkPhysicalDeviceFeatures supported_features{};
-@@ -2473,6 +2513,14 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
+@@ -2473,6 +2517,14 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
      if (!check(vkCreateDevice(impl.physical_device, &device_info, nullptr, &impl.device), "vkCreateDevice", error))
          return false;
      vkGetDeviceQueue(impl.device, impl.queue_family, 0u, &impl.queue);
@@ -167,7 +171,7 @@ index ef4fcb8..23e6903 100644
      if (impl.breadcrumbs.available) {
          Impl::Breadcrumbs &b = impl.breadcrumbs;
          VkBufferCreateInfo marker_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-@@ -2520,6 +2568,7 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
+@@ -2520,6 +2572,7 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
          }
      }
      impl.swapchain_format = impl.surface_format.format;
@@ -175,7 +179,7 @@ index ef4fcb8..23e6903 100644
      std::uint32_t mode_count = 0u;
      vkGetPhysicalDeviceSurfacePresentModesKHR(impl.physical_device, impl.surface, &mode_count, nullptr);
      impl.present_modes.resize(mode_count);
-@@ -3070,6 +3119,7 @@ void VulkanRenderer::Impl::update_display_info() {
+@@ -3070,6 +3123,7 @@ void VulkanRenderer::Impl::update_display_info() {
          if (const SDL_DisplayMode *mode = SDL_GetCurrentDisplayMode(display); mode != nullptr)
              refresh = mode->refresh_rate;
      }
@@ -183,7 +187,7 @@ index ef4fcb8..23e6903 100644
      display_hz = refresh;
      perf::set_display_info(present_mode_name(present_mode), swapchain_extent.width, swapchain_extent.height, refresh);
  }
-@@ -3086,6 +3136,7 @@ VkPresentModeKHR VulkanRenderer::Impl::wanted_present_mode() const {
+@@ -3086,6 +3140,7 @@ VkPresentModeKHR VulkanRenderer::Impl::wanted_present_mode() const {
  
  // Builds the swapchain for the window's current size, replacing the old one.
  bool VulkanRenderer::Impl::create_swapchain(std::string &error) {
@@ -191,7 +195,7 @@ index ef4fcb8..23e6903 100644
      VkSurfaceCapabilitiesKHR capabilities{};
      vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface, &capabilities);
      VkExtent2D extent = capabilities.currentExtent;
-@@ -3194,6 +3245,60 @@ bool VulkanRenderer::Impl::create_swapchain(std::string &error) {
+@@ -3194,6 +3249,60 @@ bool VulkanRenderer::Impl::create_swapchain(std::string &error) {
      return true;
  }
  
@@ -252,7 +256,7 @@ index ef4fcb8..23e6903 100644
  void VulkanRenderer::Impl::destroy_swapchain_views() {
      for (VkFramebuffer framebuffer : ui_framebuffers) vkDestroyFramebuffer(device, framebuffer, nullptr);
      ui_framebuffers.clear();
-@@ -3226,6 +3331,7 @@ void VulkanRenderer::Impl::reset_surface() {
+@@ -3226,6 +3335,7 @@ void VulkanRenderer::Impl::reset_surface() {
  #endif
  
  void VulkanRenderer::Impl::recreate_swapchain() {
@@ -260,7 +264,7 @@ index ef4fcb8..23e6903 100644
      // A minimised window has no area to present to; keep the old swapchain
      // and try again once it has one.
      int width = 0;
-@@ -3535,11 +3641,15 @@ void VulkanRenderer::Impl::record_game_blit(VkCommandBuffer commands, VkImage so
+@@ -3535,11 +3645,15 @@ void VulkanRenderer::Impl::record_game_blit(VkCommandBuffer commands, VkImage so
  void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence fence, VkImage source,
                                                VkExtent2D source_extent, bool game_frame, bool main_frame) {
  #if defined(__ANDROID__)
@@ -279,7 +283,7 @@ index ef4fcb8..23e6903 100644
  #endif
      if (!acquired_image) {
          check_swapchain();
-@@ -3561,7 +3671,20 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
+@@ -3561,7 +3675,20 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
  
      std::uint32_t image_index = 0u;
      VkResult acquired = VK_ERROR_OUT_OF_DATE_KHR;
@@ -301,7 +305,7 @@ index ef4fcb8..23e6903 100644
          image_index = *acquired_image;
          acquired = VK_SUCCESS;
          acquired_image.reset();
-@@ -3645,6 +3768,12 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
+@@ -3645,6 +3772,12 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
                  capture = true;
              }
          }
@@ -314,7 +318,7 @@ index ef4fcb8..23e6903 100644
  #if defined(__ANDROID__)
          if (prerotated() && image_index < upright_images.size()) record_rotation(commands, image_index, layout);
          else
-@@ -3658,7 +3787,13 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
+@@ -3658,7 +3791,13 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
      VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
      submit.commandBufferCount = frame_batch(commands, batch);
      submit.pCommandBuffers = batch.data();
@@ -329,7 +333,7 @@ index ef4fcb8..23e6903 100644
          submit.waitSemaphoreCount = 1u;
          submit.pWaitSemaphores = &acquire;
          submit.pWaitDstStageMask = &wait_stage;
-@@ -3670,7 +3805,8 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
+@@ -3670,7 +3809,8 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
      if (vkQueueSubmit(queue, 1u, &submit, fence) == VK_ERROR_DEVICE_LOST) device_lost("a frame's submit");
      perf::add_wait_time(perf::Clock::now() - submit_start, perf::Stall::Submit);
  
@@ -339,7 +343,7 @@ index ef4fcb8..23e6903 100644
          VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
          present.waitSemaphoreCount = 1u;
          present.pWaitSemaphores = &render_finished[image_index];
-@@ -5906,7 +6042,7 @@ void VulkanRenderer::begin_frame() {
+@@ -5906,7 +6046,7 @@ void VulkanRenderer::begin_frame() {
      }
      // With frame interpolation each frame writes the next region and is
      // recorded for drawing again; without it, the first region as before.
@@ -348,7 +352,7 @@ index ef4fcb8..23e6903 100644
      const std::uint32_t region = impl.interpolating ? impl.next_region : impl.slot;
      // A region another frame in flight, or a present between flips, may
      // still draw from is waited for first (only when interpolation has just
-@@ -7719,6 +7855,7 @@ double VulkanRenderer::Impl::wanted_rate() const {
+@@ -7719,6 +7859,7 @@ double VulkanRenderer::Impl::wanted_rate() const {
  }
  
  bool VulkanRenderer::Impl::interpolation_wanted() const {
@@ -356,7 +360,7 @@ index ef4fcb8..23e6903 100644
      // Emulated time running ahead of real time already presents faster than
      // the game's own rate; the keyboard's held frame is shown as it is.
      return frame_rate != settings::FrameRate::Fps30 && !settings::current().unthrottled && !holding && !fast_forward &&
-@@ -8050,6 +8187,529 @@ bool VulkanRenderer::Impl::present_between(const pacing::PresentClock::Present &
+@@ -8050,6 +8191,558 @@ bool VulkanRenderer::Impl::present_between(const pacing::PresentClock::Present &
      return true;
  }
  
@@ -526,12 +530,36 @@ index ef4fcb8..23e6903 100644
 +    }
 +    xr::StereoFrame stereo{};
 +    if (!xr::bridge()->stereo_begin(stereo)) return;
++    // The eye passes' GPU time: this slot's last pair has finished (begin_frame waited for its fence).
++    if (eye_timer == VK_NULL_HANDLE && gpu_timer != VK_NULL_HANDLE) {
++        VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
++        info.queryType = VK_QUERY_TYPE_TIMESTAMP;
++        info.queryCount = 2u * kMaxSlots;
++        if (vkCreateQueryPool(device, &info, nullptr, &eye_timer) != VK_SUCCESS) eye_timer = VK_NULL_HANDLE;
++    }
++    if (eye_timer != VK_NULL_HANDLE && eye_timed[slot]) {
++        std::array<std::uint64_t, 2> ticks{};
++        if (vkGetQueryPoolResults(device, eye_timer, slot * 2u, 2u, sizeof(ticks), ticks.data(), sizeof(std::uint64_t),
++                                  VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
++            eye_gpu_ms += static_cast<double>((ticks[1] - ticks[0]) & gpu_timer_mask) * gpu_timer_ns_per_tick / 1.0e6;
++            ++eye_gpu_samples;
++        }
++        eye_timed[slot] = false;
++    }
++    if (eye_timer != VK_NULL_HANDLE) {
++        vkCmdResetQueryPool(commands, eye_timer, slot * 2u, 2u);
++        vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, eye_timer, slot * 2u);
++    }
 +    std::array<VkImage, 2> images{};
 +    for (std::uint32_t eye = 0; eye < 2u; ++eye) {
 +        replay_eye(commands, eye_targets[eye], stereo, eye);
 +        transition(commands, eye_targets[eye].color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 +                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
 +        images[eye] = eye_targets[eye].color;
++    }
++    if (eye_timer != VK_NULL_HANDLE) {
++        vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, eye_timer, slot * 2u + 1u);
++        eye_timed[slot] = true;
 +    }
 +    xr::bridge()->record_stereo(commands, images, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, extent);
 +    for (const Target &target : eye_targets)
@@ -866,6 +894,11 @@ index ef4fcb8..23e6903 100644
 +    // Every five seconds or so: what the eyes drew, and the numbers that say
 +    // whether the game's eye space was read right and how big its units are.
 +    if (eye == 0u && stereo_frames++ % 360u == 0u) {
++        if (eye_gpu_samples != 0u)
++            std::printf("[vr] GPU time of the two eyes: %.2f ms a frame (%u frames)\n",
++                        eye_gpu_ms / static_cast<double>(eye_gpu_samples), eye_gpu_samples);
++        eye_gpu_ms = 0.0;
++        eye_gpu_samples = 0u;
 +        std::printf("[vr] stereo: %u 3D, %u full-screen (%u glow left out), %u sprite and %u flat draw calls, eye %ux%u, nearest 3D object %.2f units away, "
 +                    "%.3g units a metre, interface %.0f..%.0f x %.0f..%.0f\n",
 +                    perspective, fullscreen, glows, sprites, flat, target.extent.width, target.extent.height, static_cast<double>(nearest),
@@ -886,7 +919,7 @@ index ef4fcb8..23e6903 100644
  // Draws the older frame into the slot's blend target with every matched
  // draw's transforms blended a fraction `t` towards the newer frame's. Draws
  // without a partner in the newer frame, and those never blended (2D, the
-@@ -8464,6 +9124,7 @@ void VulkanRenderer::Impl::reset_interpolation() {
+@@ -8464,6 +9157,7 @@ void VulkanRenderer::Impl::reset_interpolation() {
  void VulkanRenderer::Impl::destroy_interpolation_targets() {
      for (Target &picture : pictures) destroy_target(picture);
      for (Target &target : blend_targets) destroy_target(target);
@@ -894,7 +927,7 @@ index ef4fcb8..23e6903 100644
      older_picture_valid = newer_picture_valid = false;
  }
  
-@@ -8646,8 +9307,14 @@ bool VulkanRenderer::present(std::uint32_t display_address,
+@@ -8646,8 +9340,14 @@ bool VulkanRenderer::present(std::uint32_t display_address,
          impl.poll_presents(std::chrono::steady_clock::now(), false, false);
          return false;
      }

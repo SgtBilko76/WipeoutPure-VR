@@ -229,6 +229,12 @@ private:
     // The display time of the headset's next frame, for locating the eyes.
     std::atomic<XrTime> next_display_time_{0};
     std::uint64_t stereo_presents_{};
+    // The renderer's time in the bridge (ms, summed until logged): locating the eyes and waiting for their images,
+    // the screen's image, and the release.
+    struct Spent {
+        double stereo{}, panel{}, release{}, lock{};
+        std::uint32_t presents{};
+    } spent_;
 
     XrActionSet actions_{XR_NULL_HANDLE};
     XrAction a_{}, b_{}, x_{}, y_{}, menu_{}, left_click_{}, right_click_{};
@@ -821,6 +827,12 @@ void QuestXr::record_copy(VkCommandBuffer commands, VkImage source, VkImageLayou
 
 void QuestXr::record_present(VkCommandBuffer commands, VkImage image, VkImageLayout layout, VkExtent2D extent) {
     if (!running_.load()) return;
+    const auto started = std::chrono::steady_clock::now();
+    struct Add {
+        double &to;
+        std::chrono::steady_clock::time_point from;
+        ~Add() { to += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - from).count(); }
+    } add{spent_.panel, started};
     std::uint32_t index = 0;
     {
         std::lock_guard lock(xr_mutex_);
@@ -846,13 +858,21 @@ void QuestXr::record_present(VkCommandBuffer commands, VkImage image, VkImageLay
 // swapchain to copy their pictures into.
 bool QuestXr::stereo_begin(portablekit::gpu::xr::StereoFrame &stereo) {
     if (!running_.load() || !visible_.load() || eye_extent_.width == 0u) return false;
+    const auto started = std::chrono::steady_clock::now();
+    struct Add {
+        double &to;
+        std::chrono::steady_clock::time_point from;
+        ~Add() { to += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - from).count(); }
+    } add{spent_.stereo, started};
     const XrTime when = next_display_time_.load();
     if (when == 0) return false;
     std::array<XrView, 2> views{};
     for (XrView &view : views) view.type = XR_TYPE_VIEW;
     std::array<std::uint32_t, 2> index{};
     {
+        const auto lock_start = std::chrono::steady_clock::now();
         std::lock_guard lock(xr_mutex_);
+        spent_.lock += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - lock_start).count();
         XrViewLocateInfo locate{XR_TYPE_VIEW_LOCATE_INFO};
         locate.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
         locate.displayTime = when;
@@ -926,6 +946,17 @@ void QuestXr::record_stereo(VkCommandBuffer commands, const std::array<VkImage, 
 
 void QuestXr::end_frame() {
     if (!acquired_ && !stereo_acquired_) return;
+    const auto started = std::chrono::steady_clock::now();
+    struct Add {
+        double &to;
+        std::chrono::steady_clock::time_point from;
+        ~Add() { to += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - from).count(); }
+    } add{spent_.release, started};
+    if (++spent_.presents == 300u) {
+        log("bridge time a present: eyes %.2f ms (lock %.2f), screen %.2f ms, release %.2f ms",
+            spent_.stereo / 300.0, spent_.lock / 300.0, spent_.panel / 300.0, spent_.release / 300.0);
+        spent_ = {};
+    }
     const bool panel = acquired_;
     const bool stereo = stereo_acquired_;
     acquired_ = false;
