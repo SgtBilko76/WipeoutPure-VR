@@ -312,27 +312,59 @@ void VulkanRenderer::Impl::replay_eye(VkCommandBuffer commands, Target &target, 
             state.viewport = {0.0f, 0.0f, width, height, min_depth, max_depth};
             state.scissor = all;
         } else if (const int cover = [&] {
-                       // 1: a screen-space draw over the whole screen; 0: anything else.
-                       if (!summary.through || drawn.raw || drawn.vertex_count == 0u || drawn.vertex_count > 4096u ||
+                       // 2: the game's glow, 1: an effect over the whole screen, or right across it (a hit's flash,
+                       // a tint, strips of a wipe), 0: anything else. Screen-space draws by their vertices, transformed
+                       // 2D draws (orthographic) by where their own matrices put them.
+                       if (drawn.raw || drawn.vertex_count == 0u || drawn.vertex_count > 4096u ||
                            drawn.vertex_base + drawn.vertex_count * sizeof(GpuVertex) > kVertexBufferTotal)
                            return 0;
                        const auto *v = reinterpret_cast<const GpuVertex *>(vertices + drawn.vertex_base);
                        float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
-                       for (std::uint32_t i = 0; i < drawn.vertex_count; ++i) {
-                           x0 = std::min(x0, v[i].x), x1 = std::max(x1, v[i].x);
-                           y0 = std::min(y0, v[i].y), y1 = std::max(y1, v[i].y);
+                       if (summary.through) {
+                           for (std::uint32_t i = 0; i < drawn.vertex_count; ++i) {
+                               x0 = std::min(x0, v[i].x), x1 = std::max(x1, v[i].x);
+                               y0 = std::min(y0, v[i].y), y1 = std::max(y1, v[i].y);
+                           }
+                       } else {
+                           const EyeMatrix m = interpolation::multiply(
+                               summary.projection, interpolation::multiply(summary.view, summary.world));
+                           for (std::uint32_t i = 0; i < drawn.vertex_count; ++i) {
+                               const float cx = m[0] * v[i].x + m[4] * v[i].y + m[8] * v[i].z + m[12];
+                               const float cy = m[1] * v[i].x + m[5] * v[i].y + m[9] * v[i].z + m[13];
+                               const float cw = m[3] * v[i].x + m[7] * v[i].y + m[11] * v[i].z + m[15];
+                               if (std::fabs(cw) < 1e-6f) return 0;
+                               const float sx = (cx / cw + 1.0f) * 0.5f * static_cast<float>(kPspWidth);
+                               const float sy = (cy / cw + 1.0f) * 0.5f * static_cast<float>(kPspHeight);
+                               x0 = std::min(x0, sx), x1 = std::max(x1, sx);
+                               y0 = std::min(y0, sy), y1 = std::max(y1, sy);
+                           }
                        }
-                       const bool whole = x1 - x0 >= 0.9f * static_cast<float>(kPspWidth) &&
-                                          y1 - y0 >= 0.9f * static_cast<float>(kPspHeight);
+                       const float w = std::min(x1, static_cast<float>(kPspWidth)) - std::max(x0, 0.0f);
+                       const float h = std::min(y1, static_cast<float>(kPspHeight)) - std::max(y0, 0.0f);
+                       const bool whole = w >= 0.9f * static_cast<float>(kPspWidth) &&
+                                          h >= 0.9f * static_cast<float>(kPspHeight);
+                       const bool across = w >= 0.9f * static_cast<float>(kPspWidth) ||
+                                           h >= 0.9f * static_cast<float>(kPspHeight);
                        const std::uint32_t texture = summary.texture_address & 0x0FFFFFFFu;
                        const bool from_vram = texture >= 0x04000000u && texture < 0x04800000u;
-                       if (tracing)
-                           std::printf("[vr] screen-space draw: %u vertices, box %.0f,%.0f..%.0f,%.0f, texture 0x%x%s\n",
-                                       drawn.vertex_count, static_cast<double>(x0), static_cast<double>(y0),
-                                       static_cast<double>(x1), static_cast<double>(y1), summary.texture_address,
-                                       whole ? (from_vram ? ": the whole screen, the glow" : ": the whole screen") : "");
-                       if (whole && from_vram && !glow_on) return 2;
-                       return whole && fullscreen_mode != 1 ? 1 : 0;
+                       const int kind = whole && from_vram && summary.through && !glow_on ? 2
+                                        : across && fullscreen_mode != 1                   ? 1
+                                                                                           : 0;
+                       // Each new kind of screen effect once (by texture and size), and every draw while tracing.
+                       static std::vector<std::uint64_t> seen;
+                       const std::uint64_t key = (static_cast<std::uint64_t>(summary.texture_address) << 24u) ^
+                                                 (static_cast<std::uint64_t>(drawn.vertex_count) << 4u) ^
+                                                 (summary.through ? 1u : 0u) ^ (whole ? 2u : 0u);
+                       const bool fresh = kind != 0 && seen.size() < 256u &&
+                                          std::find(seen.begin(), seen.end(), key) == seen.end();
+                       if (fresh) seen.push_back(key);
+                       if (fresh || (tracing && summary.through))
+                           std::printf("[vr] %s draw: %u vertices, box %.0f,%.0f..%.0f,%.0f, texture 0x%x: %s\n",
+                                       summary.through ? "screen-space" : "transformed 2D", drawn.vertex_count,
+                                       static_cast<double>(x0), static_cast<double>(y0), static_cast<double>(x1),
+                                       static_cast<double>(y1), summary.texture_address,
+                                       kind == 2 ? "the glow, left out" : kind == 1 ? "over the whole eye" : "flat");
+                       return kind;
                    }();
                    cover != 0) {
             if (cover == 2) {
