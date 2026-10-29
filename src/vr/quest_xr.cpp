@@ -33,6 +33,7 @@
 //   left stick click    pause                     start
 //   menu button         pause                     start
 //   right stick         menu cursor               D-pad
+//   left stick (menus)  menu cursor               D-pad (outside a race)
 //   both stick clicks   the port's own menu       L3 + R3
 
 #include "gpu/xr_bridge.hpp"
@@ -626,10 +627,17 @@ void QuestXr::read_input() {
             const XrVector2f right = stick(right_stick_, right_x_, right_y_);
             axes[SDL_GAMEPAD_AXIS_LEFTX] = std::clamp(left.x, -1.0f, 1.0f);
             axes[SDL_GAMEPAD_AXIS_LEFTY] = std::clamp(-left.y, -1.0f, 1.0f);  // SDL: down is positive
-            set(SDL_GAMEPAD_BUTTON_DPAD_UP, dpad_[0].update(right.y, 0.6f, 0.4f));
-            set(SDL_GAMEPAD_BUTTON_DPAD_DOWN, dpad_[1].update(-right.y, 0.6f, 0.4f));
-            set(SDL_GAMEPAD_BUTTON_DPAD_LEFT, dpad_[2].update(-right.x, 0.6f, 0.4f));
-            set(SDL_GAMEPAD_BUTTON_DPAD_RIGHT, dpad_[3].update(right.x, 0.6f, 0.4f));
+            // The menus move with the D-pad: the right stick, and outside a race the left one too (in a race the
+            // left stick steers, and the game would read the D-pad as digital steering on top of it).
+            XrVector2f menu = right;
+            if (!portablekit::gpu::xr::scene_3d()) {
+                if (std::fabs(left.x) > std::fabs(menu.x)) menu.x = left.x;
+                if (std::fabs(left.y) > std::fabs(menu.y)) menu.y = left.y;
+            }
+            set(SDL_GAMEPAD_BUTTON_DPAD_UP, dpad_[0].update(menu.y, 0.6f, 0.4f));
+            set(SDL_GAMEPAD_BUTTON_DPAD_DOWN, dpad_[1].update(-menu.y, 0.6f, 0.4f));
+            set(SDL_GAMEPAD_BUTTON_DPAD_LEFT, dpad_[2].update(-menu.x, 0.6f, 0.4f));
+            set(SDL_GAMEPAD_BUTTON_DPAD_RIGHT, dpad_[3].update(menu.x, 0.6f, 0.4f));
             // Every two seconds while something is held: what the controllers send.
             if ((++input_frames_ % 144u) == 0u && (bits != 0u || left.x != 0.0f || left.y != 0.0f))
                 log("input: buttons 0x%x, left stick %.2f %.2f, right stick %.2f %.2f", bits, left.x, left.y,
