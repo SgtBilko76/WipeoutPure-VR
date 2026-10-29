@@ -1,5 +1,5 @@
 diff --git a/host/gpu/vulkan_renderer.cpp b/host/gpu/vulkan_renderer.cpp
-index ef4fcb8..0f0417d 100644
+index ef4fcb8..64cadec 100644
 --- a/host/gpu/vulkan_renderer.cpp
 +++ b/host/gpu/vulkan_renderer.cpp
 @@ -5,6 +5,7 @@
@@ -70,7 +70,7 @@ index ef4fcb8..0f0417d 100644
      std::uint32_t family_count = 0u;
      vkGetPhysicalDeviceQueueFamilyProperties(impl.physical_device, &family_count, nullptr);
      std::vector<VkQueueFamilyProperties> families(family_count);
-@@ -2411,6 +2437,11 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
+@@ -2411,14 +2437,20 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
              impl.breadcrumbs.available = true;
          }
      }
@@ -82,12 +82,25 @@ index ef4fcb8..0f0417d 100644
      if (want_breadcrumbs && !impl.breadcrumbs.available)
          std::cout << "[render] " << portablekit::env_name("GPU_BREADCRUMBS") << " needs VK_AMD_buffer_marker, which this device lacks\n";
  
-@@ -2473,6 +2504,13 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
+-    const float priority = 1.0f;
++    const float priority[2]{1.0f, 1.0f};
+     VkDeviceQueueCreateInfo queue_info{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+     queue_info.queueFamilyIndex = impl.queue_family;
+-    queue_info.queueCount = 1u;
+-    queue_info.pQueuePriorities = &priority;
++    // A headset's runtime gets a queue of its own (xr_bridge.hpp) when the family has two.
++    queue_info.queueCount = xr_wanted && families[impl.queue_family].queueCount >= 2u ? 2u : 1u;
++    queue_info.pQueuePriorities = priority;
+     // <prefix>_CHECK_GPU_DECODE: the check build of the raw vertex shader
+     // writes what it decoded to a storage buffer.
+     VkPhysicalDeviceFeatures supported_features{};
+@@ -2473,6 +2505,14 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
      if (!check(vkCreateDevice(impl.physical_device, &device_info, nullptr, &impl.device), "vkCreateDevice", error))
          return false;
      vkGetDeviceQueue(impl.device, impl.queue_family, 0u, &impl.queue);
 +    if (xr_wanted) {
-+        impl.xr = xr_bridge->start(impl.instance, impl.physical_device, impl.device, impl.queue_family, 0u);
++        impl.xr = xr_bridge->start(impl.instance, impl.physical_device, impl.device, impl.queue_family,
++                                   queue_info.queueCount - 1u);
 +        xr::active_slot() = impl.xr;
 +        std::cout << "[render] OpenXR "
 +                  << (impl.xr ? "session started: frames go to the headset" : "failed: frames go to the window")
@@ -96,7 +109,7 @@ index ef4fcb8..0f0417d 100644
      if (impl.breadcrumbs.available) {
          Impl::Breadcrumbs &b = impl.breadcrumbs;
          VkBufferCreateInfo marker_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-@@ -2520,6 +2558,7 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
+@@ -2520,6 +2560,7 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
          }
      }
      impl.swapchain_format = impl.surface_format.format;
@@ -104,7 +117,15 @@ index ef4fcb8..0f0417d 100644
      std::uint32_t mode_count = 0u;
      vkGetPhysicalDeviceSurfacePresentModesKHR(impl.physical_device, impl.surface, &mode_count, nullptr);
      impl.present_modes.resize(mode_count);
-@@ -3086,6 +3125,7 @@ VkPresentModeKHR VulkanRenderer::Impl::wanted_present_mode() const {
+@@ -3070,6 +3111,7 @@ void VulkanRenderer::Impl::update_display_info() {
+         if (const SDL_DisplayMode *mode = SDL_GetCurrentDisplayMode(display); mode != nullptr)
+             refresh = mode->refresh_rate;
+     }
++    if (xr) refresh = xr::bridge()->refresh_rate();
+     display_hz = refresh;
+     perf::set_display_info(present_mode_name(present_mode), swapchain_extent.width, swapchain_extent.height, refresh);
+ }
+@@ -3086,6 +3128,7 @@ VkPresentModeKHR VulkanRenderer::Impl::wanted_present_mode() const {
  
  // Builds the swapchain for the window's current size, replacing the old one.
  bool VulkanRenderer::Impl::create_swapchain(std::string &error) {
@@ -112,7 +133,7 @@ index ef4fcb8..0f0417d 100644
      VkSurfaceCapabilitiesKHR capabilities{};
      vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface, &capabilities);
      VkExtent2D extent = capabilities.currentExtent;
-@@ -3194,6 +3234,60 @@ bool VulkanRenderer::Impl::create_swapchain(std::string &error) {
+@@ -3194,6 +3237,60 @@ bool VulkanRenderer::Impl::create_swapchain(std::string &error) {
      return true;
  }
  
@@ -173,7 +194,7 @@ index ef4fcb8..0f0417d 100644
  void VulkanRenderer::Impl::destroy_swapchain_views() {
      for (VkFramebuffer framebuffer : ui_framebuffers) vkDestroyFramebuffer(device, framebuffer, nullptr);
      ui_framebuffers.clear();
-@@ -3226,6 +3320,7 @@ void VulkanRenderer::Impl::reset_surface() {
+@@ -3226,6 +3323,7 @@ void VulkanRenderer::Impl::reset_surface() {
  #endif
  
  void VulkanRenderer::Impl::recreate_swapchain() {
@@ -181,7 +202,7 @@ index ef4fcb8..0f0417d 100644
      // A minimised window has no area to present to; keep the old swapchain
      // and try again once it has one.
      int width = 0;
-@@ -3535,11 +3630,15 @@ void VulkanRenderer::Impl::record_game_blit(VkCommandBuffer commands, VkImage so
+@@ -3535,11 +3633,15 @@ void VulkanRenderer::Impl::record_game_blit(VkCommandBuffer commands, VkImage so
  void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence fence, VkImage source,
                                                VkExtent2D source_extent, bool game_frame, bool main_frame) {
  #if defined(__ANDROID__)
@@ -200,7 +221,7 @@ index ef4fcb8..0f0417d 100644
  #endif
      if (!acquired_image) {
          check_swapchain();
-@@ -3561,7 +3660,15 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
+@@ -3561,7 +3663,15 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
  
      std::uint32_t image_index = 0u;
      VkResult acquired = VK_ERROR_OUT_OF_DATE_KHR;
@@ -217,7 +238,7 @@ index ef4fcb8..0f0417d 100644
          image_index = *acquired_image;
          acquired = VK_SUCCESS;
          acquired_image.reset();
-@@ -3645,6 +3752,10 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
+@@ -3645,6 +3755,10 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
                  capture = true;
              }
          }
@@ -228,16 +249,22 @@ index ef4fcb8..0f0417d 100644
  #if defined(__ANDROID__)
          if (prerotated() && image_index < upright_images.size()) record_rotation(commands, image_index, layout);
          else
-@@ -3658,7 +3769,7 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
+@@ -3658,7 +3772,13 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
      VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
      submit.commandBufferCount = frame_batch(commands, batch);
      submit.pCommandBuffers = batch.data();
 -    if (can_present) {
++    // The headset's copy of the frame waits for this submit (xr_bridge.hpp).
++    VkSemaphore xr_signal = xr && can_present ? xr::bridge()->frame_semaphore() : VK_NULL_HANDLE;
++    if (xr_signal != VK_NULL_HANDLE) {
++        submit.signalSemaphoreCount = 1u;
++        submit.pSignalSemaphores = &xr_signal;
++    }
 +    if (can_present && !xr) {
          submit.waitSemaphoreCount = 1u;
          submit.pWaitSemaphores = &acquire;
          submit.pWaitDstStageMask = &wait_stage;
-@@ -3670,7 +3781,8 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
+@@ -3670,7 +3790,8 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
      if (vkQueueSubmit(queue, 1u, &submit, fence) == VK_ERROR_DEVICE_LOST) device_lost("a frame's submit");
      perf::add_wait_time(perf::Clock::now() - submit_start, perf::Stall::Submit);
  
@@ -247,7 +274,7 @@ index ef4fcb8..0f0417d 100644
          VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
          present.waitSemaphoreCount = 1u;
          present.pWaitSemaphores = &render_finished[image_index];
-@@ -7719,6 +7831,7 @@ double VulkanRenderer::Impl::wanted_rate() const {
+@@ -7719,6 +7840,7 @@ double VulkanRenderer::Impl::wanted_rate() const {
  }
  
  bool VulkanRenderer::Impl::interpolation_wanted() const {
@@ -257,10 +284,10 @@ index ef4fcb8..0f0417d 100644
      return frame_rate != settings::FrameRate::Fps30 && !settings::current().unthrottled && !holding && !fast_forward &&
 diff --git a/host/gpu/xr_bridge.hpp b/host/gpu/xr_bridge.hpp
 new file mode 100644
-index 0000000..55ee545
+index 0000000..e699659
 --- /dev/null
 +++ b/host/gpu/xr_bridge.hpp
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,90 @@
 +#pragma once
 +
 +// An OpenXR runtime that the Vulkan renderer presents into instead of its
@@ -270,19 +297,24 @@ index 0000000..55ee545
 +//
 +// What the renderer does with an active bridge:
 +// - It asks for the runtime's Vulkan instance and device extensions, renders
-+//   on the runtime's physical device and hands the device and its queue over
-+//   (start()).
++//   on the runtime's physical device, makes a second queue on its graphics
++//   family when the family has one, and hands the device over (start()) with
++//   the queue the runtime may use: index 1 then, which the renderer itself
++//   never touches, so the runtime's frame loop can run on a thread of its own
++//   without sharing a queue with the renderer.
 +// - Its "swapchain" is a ring of its own images at panel_extent(), in a plain
 +//   8-bit UNORM format, so the picture and the in-game menu are drawn into
-+//   them exactly as into a window. Each present calls begin_frame(), records
-+//   the frame into one of them, then record_present() copies that image into
-+//   the runtime's swapchain in the same command buffer, and end_frame()
-+//   follows the queue submit.
-+// - It does not present to the window, and frame interpolation is off.
-+// - The bridge's eye pass (stereo) runs from record_present(): it gets the
-+//   renderer's hooks through set_eye_renderer() below.
++//   them exactly as into a window. Each present calls begin_frame() (which
++//   must not block: the runtime's pace is the bridge's business), records the
++//   frame into one of them, then record_present() copies that image into the
++//   runtime's swapchain in the same command buffer. The renderer's submit
++//   signals frame_semaphore() when it is not null, and end_frame() follows
++//   the submit.
++// - It does not present to the window, frame interpolation is off, and the
++//   display's refresh it reports (the game's display rate) is refresh_rate().
 +//
-+// All calls come from the renderer's thread.
++// begin_frame(), record_present(), frame_semaphore() and end_frame() come
++// from the renderer's thread; button() and axis() from the game's input poll.
 +
 +#include <vulkan/vulkan.h>
 +
@@ -302,21 +334,26 @@ index 0000000..55ee545
 +    // After vkCreateInstance: the device the runtime renders with, or null.
 +    virtual VkPhysicalDevice physical_device(VkInstance instance) = 0;
 +    virtual void device_extensions(VkPhysicalDevice physical_device, std::vector<const char *> &extensions) = 0;
-+    // After vkCreateDevice. False: the session could not start; the
-+    // renderer then presents to its window.
++    // After vkCreateDevice. `queue_index` is the runtime's queue: 1 when the
++    // renderer made a second one, 0 when it shares the renderer's. False: the
++    // session could not start; the renderer then presents to its window.
 +    virtual bool start(VkInstance instance, VkPhysicalDevice physical_device, VkDevice device,
 +                       std::uint32_t queue_family, std::uint32_t queue_index) = 0;
 +
 +    // The size of the virtual screen the renderer draws its frames at.
 +    [[nodiscard]] virtual VkExtent2D panel_extent() const = 0;
++    // The headset display's refresh in Hz.
++    [[nodiscard]] virtual float refresh_rate() const = 0;
 +
-+    // A present. begin_frame() false: the runtime shows nothing this frame
-+    // (the session is not visible); end_frame() is still called.
++    // A present. begin_frame() false: the runtime shows nothing now (the
++    // session is not visible); end_frame() is still called. Never blocks.
 +    virtual bool begin_frame() = 0;
 +    // `image` holds the frame in `layout` (TRANSFER_SRC_OPTIMAL), `extent`
-+    // big. Copies it into the runtime's swapchain.
++    // big. Records its copy into the runtime's swapchain.
 +    virtual void record_present(VkCommandBuffer commands, VkImage image, VkImageLayout layout,
 +                                VkExtent2D extent) = 0;
++    // A binary semaphore the frame's submit signals, or null.
++    [[nodiscard]] virtual VkSemaphore frame_semaphore() = 0;
 +    // After the command buffer was submitted.
 +    virtual void end_frame() = 0;
 +
@@ -342,7 +379,7 @@ index 0000000..55ee545
 +
 +} // namespace portablekit::gpu::xr
 diff --git a/host/platform/android_app.cpp b/host/platform/android_app.cpp
-index f5c6539..fd05073 100644
+index f5c6539..1bf2aed 100644
 --- a/host/platform/android_app.cpp
 +++ b/host/platform/android_app.cpp
 @@ -11,6 +11,9 @@
@@ -355,7 +392,7 @@ index f5c6539..fd05073 100644
  
  #include <cstdint>
  #include <cstdio>
-@@ -85,10 +88,91 @@ void unpack_bundled_fonts() {
+@@ -85,10 +88,101 @@ void unpack_bundled_fonts() {
      portablekit::set_bundled_resource_directory(root);
  }
  
@@ -425,6 +462,16 @@ index f5c6539..fd05073 100644
 +        }
 +    } catch (const std::exception &e) {
 +        std::printf("[android] unpacking the imports failed: %s\n", e.what());
++    }
++    // Test switches without a rebuild: KEY=VALUE lines in env.txt, set before anything reads them.
++    if (std::ifstream env(root / "env.txt"); env) {
++        std::string line;
++        while (std::getline(env, line)) {
++            const std::size_t equals = line.find('=');
++            if (line.empty() || line[0] == '#' || equals == std::string::npos) continue;
++            setenv(line.substr(0, equals).c_str(), line.substr(equals + 1).c_str(), 1);
++            std::printf("[android] env.txt: %s\n", line.c_str());
++        }
 +    }
 +    setenv(portablekit::env_name("DATA_DIR").c_str(), root.c_str(), 0);
 +    const std::filesystem::path game = root / "game";

@@ -8,6 +8,12 @@ import sys
 root = pathlib.Path(sys.argv[1])
 changed = []
 
+header = pathlib.Path(__file__).with_name("xr_bridge.hpp").read_text()
+target = root / "host/gpu/xr_bridge.hpp"
+if not target.exists() or target.read_text() != header:
+    target.write_text(header)
+    changed.append("host/gpu/xr_bridge.hpp")
+
 
 def edit(rel, old, new, count=1):
     path = root / rel
@@ -77,7 +83,8 @@ edit(R, "    if (want_breadcrumbs && !impl.breadcrumbs.available)\n",
 edit(R, "    vkGetDeviceQueue(impl.device, impl.queue_family, 0u, &impl.queue);\n",
      "    vkGetDeviceQueue(impl.device, impl.queue_family, 0u, &impl.queue);\n"
      "    if (xr_wanted) {\n"
-     "        impl.xr = xr_bridge->start(impl.instance, impl.physical_device, impl.device, impl.queue_family, 0u);\n"
+     "        impl.xr = xr_bridge->start(impl.instance, impl.physical_device, impl.device, impl.queue_family,\n"
+     "                                   queue_info.queueCount - 1u);\n"
      "        xr::active_slot() = impl.xr;\n"
      "        std::cout << \"[render] OpenXR \"\n"
      "                  << (impl.xr ? \"session started: frames go to the headset\" : \"failed: frames go to the window\")\n"
@@ -205,7 +212,30 @@ edit(R, "#if defined(__ANDROID__)\n"
      "#endif\n"
      "            transition(commands, target, layout, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);\n")
 edit(R, "    if (can_present) {\n        submit.waitSemaphoreCount = 1u;\n",
+     "    // The headset's copy of the frame waits for this submit (xr_bridge.hpp).\n"
+     "    VkSemaphore xr_signal = xr && can_present ? xr::bridge()->frame_semaphore() : VK_NULL_HANDLE;\n"
+     "    if (xr_signal != VK_NULL_HANDLE) {\n"
+     "        submit.signalSemaphoreCount = 1u;\n"
+     "        submit.pSignalSemaphores = &xr_signal;\n"
+     "    }\n"
      "    if (can_present && !xr) {\n        submit.waitSemaphoreCount = 1u;\n")
+
+# A second queue for the runtime, when the family has one.
+edit(R, "    const float priority = 1.0f;\n"
+        "    VkDeviceQueueCreateInfo queue_info{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};\n"
+        "    queue_info.queueFamilyIndex = impl.queue_family;\n"
+        "    queue_info.queueCount = 1u;\n"
+        "    queue_info.pQueuePriorities = &priority;\n",
+     "    const float priority[2]{1.0f, 1.0f};\n"
+     "    VkDeviceQueueCreateInfo queue_info{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};\n"
+     "    queue_info.queueFamilyIndex = impl.queue_family;\n"
+     "    // A headset's runtime gets a queue of its own (xr_bridge.hpp) when the family has two.\n"
+     "    queue_info.queueCount = xr_wanted && families[impl.queue_family].queueCount >= 2u ? 2u : 1u;\n"
+     "    queue_info.pQueuePriorities = priority;\n")
+
+# The display's refresh is the headset's.
+edit(R, "    display_hz = refresh;\n    perf::set_display_info(",
+     "    if (xr) refresh = xr::bridge()->refresh_rate();\n    display_hz = refresh;\n    perf::set_display_info(")
 edit(R, "    if (can_present) {\n        VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};\n",
      "    if (xr) xr::bridge()->end_frame();\n"
      "    if (can_present && !xr) {\n        VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};\n")
@@ -313,6 +343,16 @@ edit(A, "} // namespace\n\nint main(int argc, char *argv[]) {\n    redirect_outp
      "        }\n"
      "    } catch (const std::exception &e) {\n"
      "        std::printf(\"[android] unpacking the imports failed: %s\\n\", e.what());\n"
+     "    }\n"
+     "    // Test switches without a rebuild: KEY=VALUE lines in env.txt, set before anything reads them.\n"
+     "    if (std::ifstream env(root / \"env.txt\"); env) {\n"
+     "        std::string line;\n"
+     "        while (std::getline(env, line)) {\n"
+     "            const std::size_t equals = line.find('=');\n"
+     "            if (line.empty() || line[0] == '#' || equals == std::string::npos) continue;\n"
+     "            setenv(line.substr(0, equals).c_str(), line.substr(equals + 1).c_str(), 1);\n"
+     "            std::printf(\"[android] env.txt: %s\\n\", line.c_str());\n"
+     "        }\n"
      "    }\n"
      "    setenv(portablekit::env_name(\"DATA_DIR\").c_str(), root.c_str(), 0);\n"
      "    const std::filesystem::path game = root / \"game\";\n"

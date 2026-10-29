@@ -6,6 +6,17 @@
 // gamepad the port already understands, so every button stays rebindable in
 // its Controls tab.
 //
+// Two threads. The game's (the renderer's) copies each frame it makes into
+// the screen swapchain and releases the image, never waiting for the
+// headset. The headset's own thread runs the OpenXR frame loop at the
+// display's rate (xrWaitFrame, xrBeginFrame, xrEndFrame with the screen
+// layer, which shows the image released last) and reads the controllers.
+// The runtime has a Vulkan queue of its own (index 1, which the renderer
+// never uses); the frame's copy is ordered before the runtime's use of the
+// image by a semaphore the renderer's submit signals and an empty submit on
+// the runtime's queue waits for. Every call that may touch the runtime's
+// queue holds xr_mutex_.
+//
 // Stage 1 of the port (README-QUEST.md): the whole game on the screen; the
 // stereo race view follows.
 //
@@ -40,11 +51,14 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -56,6 +70,8 @@ constexpr std::uint32_t kPanelHeight = 1088u;
 // head at start. 2.2 m away and 1.3 rad (75 degrees) wide.
 constexpr float kScreenRadius = 2.2f;
 constexpr float kScreenAngle = 1.3f;
+// Frames in flight on the renderer's side, at most: one semaphore each.
+constexpr std::size_t kSemaphores = 4;
 
 void vlog(const char *format, va_list args) {
     va_list copy;
@@ -113,8 +129,12 @@ public:
     bool start(VkInstance instance, VkPhysicalDevice physical_device, VkDevice device, std::uint32_t queue_family,
                std::uint32_t queue_index) override;
     [[nodiscard]] VkExtent2D panel_extent() const override { return {kPanelWidth, kPanelHeight}; }
+    [[nodiscard]] float refresh_rate() const override { return refresh_.load(std::memory_order_relaxed); }
     bool begin_frame() override;
     void record_present(VkCommandBuffer commands, VkImage image, VkImageLayout layout, VkExtent2D extent) override;
+    [[nodiscard]] VkSemaphore frame_semaphore() override {
+        return acquired_ ? semaphores_[next_semaphore_] : VK_NULL_HANDLE;
+    }
     void end_frame() override;
     [[nodiscard]] bool button(int button) const override {
         return button >= 0 && button < 32 && (buttons_.load(std::memory_order_relaxed) & (1u << button)) != 0u;
@@ -129,6 +149,7 @@ private:
     bool has_extension(const char *name) const {
         return std::find(available_.begin(), available_.end(), name) != available_.end();
     }
+    void frame_loop();
     void poll_events();
     bool create_actions();
     void read_input();
@@ -149,21 +170,37 @@ private:
     XrSwapchain swapchain_{XR_NULL_HANDLE};
     std::vector<XrSwapchainImageVulkanKHR> images_;
     std::int64_t swapchain_format_{};
-    XrSessionState state_{XR_SESSION_STATE_UNKNOWN};
-    bool running_{};
-    bool frame_begun_{};
-    bool image_acquired_{};
-    XrFrameState frame_{XR_TYPE_FRAME_STATE};
     std::vector<std::string> available_;
     std::vector<std::string> instance_extensions_;
     std::vector<std::string> device_extensions_;
     bool cylinder_{};
     bool pico_{};
+    bool refresh_ext_{};
 
     PFN_xrGetVulkanInstanceExtensionsKHR get_instance_extensions_{};
     PFN_xrGetVulkanDeviceExtensionsKHR get_device_extensions_{};
     PFN_xrGetVulkanGraphicsDeviceKHR get_graphics_device_{};
     PFN_xrGetVulkanGraphicsRequirementsKHR get_graphics_requirements_{};
+    PFN_xrGetDisplayRefreshRateFB get_refresh_rate_{};
+
+    // Vulkan: the runtime's queue and the semaphores ordering the copies.
+    VkDevice device_{VK_NULL_HANDLE};
+    VkQueue xr_queue_{VK_NULL_HANDLE};
+    bool shared_queue_{};
+    std::array<VkSemaphore, kSemaphores> semaphores_{};
+    std::size_t next_semaphore_{};
+
+    // Shared by the two threads.
+    std::mutex xr_mutex_;
+    std::atomic<bool> running_{};    // between xrBeginSession and xrEndSession
+    std::atomic<bool> visible_{};    // VISIBLE or FOCUSED: frames are shown
+    std::atomic<bool> has_image_{};  // the swapchain has had an image released
+    std::atomic<float> refresh_{72.0f};
+    std::thread thread_;
+    XrSessionState state_{XR_SESSION_STATE_UNKNOWN};  // the frame thread's
+
+    // The renderer's frame.
+    bool acquired_{};
 
     XrActionSet actions_{XR_NULL_HANDLE};
     XrAction a_{}, b_{}, x_{}, y_{}, menu_{}, left_click_{}, right_click_{};
@@ -217,6 +254,8 @@ bool QuestXr::prepare() {
     if (cylinder_) enabled.push_back(XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME);
     pico_ = has_extension(XR_BD_CONTROLLER_INTERACTION_EXTENSION_NAME);
     if (pico_) enabled.push_back(XR_BD_CONTROLLER_INTERACTION_EXTENSION_NAME);
+    refresh_ext_ = has_extension(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
+    if (refresh_ext_) enabled.push_back(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
 
     XrInstanceCreateInfoAndroidKHR android{XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR};
     android.applicationVM = vm;
@@ -243,6 +282,7 @@ bool QuestXr::prepare() {
         !get("xrGetVulkanGraphicsDeviceKHR", get_graphics_device_) ||
         !get("xrGetVulkanGraphicsRequirementsKHR", get_graphics_requirements_))
         return false;
+    if (refresh_ext_ && !get("xrGetDisplayRefreshRateFB", get_refresh_rate_)) refresh_ext_ = false;
     XrInstanceProperties instance_properties{XR_TYPE_INSTANCE_PROPERTIES};
     xrGetInstanceProperties(instance_, &instance_properties);
     log("OpenXR runtime %s %u.%u.%u, cylinder layer %s, PICO controllers %s", instance_properties.runtimeName,
@@ -284,6 +324,19 @@ void QuestXr::device_extensions(VkPhysicalDevice, std::vector<const char *> &ext
 
 bool QuestXr::start(VkInstance instance, VkPhysicalDevice physical_device, VkDevice device,
                     std::uint32_t queue_family, std::uint32_t queue_index) {
+    device_ = device;
+    vkGetDeviceQueue(device, queue_family, queue_index, &xr_queue_);
+    shared_queue_ = queue_index == 0u;
+    for (VkSemaphore &semaphore : semaphores_) {
+        VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        if (vkCreateSemaphore(device, &info, nullptr, &semaphore) != VK_SUCCESS) {
+            log("vkCreateSemaphore failed");
+            return false;
+        }
+    }
+    log("the runtime's queue: family %u index %u%s", queue_family, queue_index,
+        shared_queue_ ? " (shared with the renderer: frames may stall)" : "");
+
     XrGraphicsBindingVulkanKHR binding{XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR};
     binding.instance = instance;
     binding.physicalDevice = physical_device;
@@ -332,7 +385,14 @@ bool QuestXr::start(VkInstance instance, VkPhysicalDevice physical_device, VkDev
                                reinterpret_cast<XrSwapchainImageBaseHeader *>(images_.data()));
     log("screen swapchain %ux%u, format %lld, %u images", kPanelWidth, kPanelHeight,
         static_cast<long long>(swapchain_format_), count);
-    return create_actions();
+    if (refresh_ext_) {
+        float rate = 0.0f;
+        if (XR_SUCCEEDED(get_refresh_rate_(session_, &rate)) && rate > 0.0f) refresh_.store(rate);
+    }
+    log("display refresh %.0f Hz", static_cast<double>(refresh_.load()));
+    if (!create_actions()) return false;
+    thread_ = std::thread([this] { frame_loop(); });
+    return true;
 }
 
 XrAction QuestXr::make_action(const char *name, XrActionType type) {
@@ -435,6 +495,7 @@ XrVector2f QuestXr::stick(XrAction vector, XrAction x, XrAction y) const {
     return result;
 }
 
+// The frame thread's: once a headset frame.
 void QuestXr::read_input() {
     std::uint32_t bits = 0u;
     std::array<float, SDL_GAMEPAD_AXIS_COUNT> axes{};
@@ -484,6 +545,7 @@ void QuestXr::read_input() {
     for (std::size_t i = 0; i < axes.size(); ++i) axes_[i].store(axes[i], std::memory_order_relaxed);
 }
 
+// The frame thread's.
 void QuestXr::poll_events() {
     XrEventDataBuffer event{XR_TYPE_EVENT_DATA_BUFFER};
     while (xrPollEvent(instance_, &event) == XR_SUCCESS) {
@@ -491,59 +553,130 @@ void QuestXr::poll_events() {
             const auto &changed = reinterpret_cast<const XrEventDataSessionStateChanged &>(event);
             state_ = changed.state;
             log("session state %d", static_cast<int>(state_));
+            visible_.store(state_ == XR_SESSION_STATE_VISIBLE || state_ == XR_SESSION_STATE_FOCUSED);
             if (state_ == XR_SESSION_STATE_READY) {
                 XrSessionBeginInfo begin{XR_TYPE_SESSION_BEGIN_INFO};
                 begin.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-                running_ = ok(xrBeginSession(session_, &begin), "xrBeginSession");
+                std::lock_guard lock(xr_mutex_);
+                running_.store(ok(xrBeginSession(session_, &begin), "xrBeginSession"));
             } else if (state_ == XR_SESSION_STATE_STOPPING) {
+                std::lock_guard lock(xr_mutex_);
+                running_.store(false);
                 ok(xrEndSession(session_), "xrEndSession");
-                running_ = false;
             } else if (state_ == XR_SESSION_STATE_EXITING || state_ == XR_SESSION_STATE_LOSS_PENDING) {
-                running_ = false;
+                running_.store(false);
                 SDL_Event quit{};
                 quit.type = SDL_EVENT_QUIT;
                 SDL_PushEvent(&quit);
             }
         } else if (event.type == XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED) {
             log("interaction profile changed");
+        } else if (event.type == XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB) {
+            const auto &changed = reinterpret_cast<const XrEventDataDisplayRefreshRateChangedFB &>(event);
+            refresh_.store(changed.toDisplayRefreshRate);
+            log("display refresh %.0f Hz", static_cast<double>(changed.toDisplayRefreshRate));
         } else if (event.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
-            running_ = false;
+            running_.store(false);
         }
         event = {XR_TYPE_EVENT_DATA_BUFFER};
     }
 }
 
-bool QuestXr::begin_frame() {
-    poll_events();
-    frame_begun_ = false;
-    image_acquired_ = false;
-    if (!running_) {
+// The headset's frame loop, on its own thread, at the display's rate.
+void QuestXr::frame_loop() {
+    std::uint64_t frames = 0;
+    auto window_start = std::chrono::steady_clock::now();
+    std::uint64_t window_frames = 0;
+    while (state_ != XR_SESSION_STATE_EXITING && state_ != XR_SESSION_STATE_LOSS_PENDING) {
+        poll_events();
+        if (!running_.load()) {
+            buttons_.store(0u);
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+        XrFrameState frame{XR_TYPE_FRAME_STATE};
+        XrFrameWaitInfo wait{XR_TYPE_FRAME_WAIT_INFO};
+        if (!ok(xrWaitFrame(session_, &wait, &frame), "xrWaitFrame")) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            continue;
+        }
         read_input();
-        return false;
+        std::lock_guard lock(xr_mutex_);
+        XrFrameBeginInfo begin{XR_TYPE_FRAME_BEGIN_INFO};
+        if (!ok(xrBeginFrame(session_, &begin), "xrBeginFrame")) continue;
+        XrCompositionLayerCylinderKHR cylinder{XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR};
+        XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
+        const XrCompositionLayerBaseHeader *layers[1]{};
+        std::uint32_t layer_count = 0;
+        if (frame.shouldRender == XR_TRUE && has_image_.load()) {
+            const XrSwapchainSubImage sub{swapchain_, {{0, 0}, {static_cast<std::int32_t>(kPanelWidth),
+                                                                static_cast<std::int32_t>(kPanelHeight)}}, 0};
+            const float aspect = static_cast<float>(kPanelWidth) / static_cast<float>(kPanelHeight);
+            if (cylinder_) {
+                cylinder.space = local_;
+                cylinder.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                cylinder.subImage = sub;
+                cylinder.pose.orientation.w = 1.0f;
+                cylinder.radius = kScreenRadius;
+                cylinder.centralAngle = kScreenAngle;
+                cylinder.aspectRatio = aspect;
+                layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&cylinder);
+            } else {
+                const float width = kScreenRadius * kScreenAngle;
+                quad.space = local_;
+                quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                quad.subImage = sub;
+                quad.pose.orientation.w = 1.0f;
+                quad.pose.position.z = -kScreenRadius;
+                quad.size = {width, width / aspect};
+                layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&quad);
+            }
+        }
+        XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};
+        end.displayTime = frame.predictedDisplayTime;
+        end.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+        end.layerCount = layer_count;
+        end.layers = layers;
+        ok(xrEndFrame(session_, &end), "xrEndFrame");
+        ++frames;
+        ++window_frames;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - window_start >= std::chrono::seconds(10)) {
+            const double seconds = std::chrono::duration<double>(now - window_start).count();
+            log("headset frames: %.1f a second (%llu in all)", static_cast<double>(window_frames) / seconds,
+                static_cast<unsigned long long>(frames));
+            window_start = now;
+            window_frames = 0;
+        }
     }
-    frame_ = {XR_TYPE_FRAME_STATE};
-    XrFrameWaitInfo wait{XR_TYPE_FRAME_WAIT_INFO};
-    if (!ok(xrWaitFrame(session_, &wait, &frame_), "xrWaitFrame")) return false;
-    XrFrameBeginInfo begin{XR_TYPE_FRAME_BEGIN_INFO};
-    if (!ok(xrBeginFrame(session_, &begin), "xrBeginFrame")) return false;
-    frame_begun_ = true;
-    read_input();
-    return frame_.shouldRender == XR_TRUE;
+    log("frame loop ended");
+}
+
+// The renderer's side. Never blocks for the headset.
+bool QuestXr::begin_frame() {
+    acquired_ = false;
+    return running_.load() && visible_.load();
 }
 
 void QuestXr::record_present(VkCommandBuffer commands, VkImage image, VkImageLayout layout, VkExtent2D extent) {
-    if (!frame_begun_ || frame_.shouldRender != XR_TRUE) return;
+    if (!running_.load()) return;
     std::uint32_t index = 0;
-    XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-    if (!ok(xrAcquireSwapchainImage(swapchain_, &acquire, &index), "xrAcquireSwapchainImage")) return;
+    {
+        std::lock_guard lock(xr_mutex_);
+        XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+        if (!ok(xrAcquireSwapchainImage(swapchain_, &acquire, &index), "xrAcquireSwapchainImage")) return;
+    }
+    // The compositor is done with the image it hands out at once, as a rule:
+    // three images and one present between two of its frames at most.
     XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-    wait.timeout = XR_INFINITE_DURATION;
+    wait.timeout = 100'000'000;  // 100 ms
     if (!ok(xrWaitSwapchainImage(swapchain_, &wait), "xrWaitSwapchainImage")) {
+        std::lock_guard lock(xr_mutex_);
         XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
         xrReleaseSwapchainImage(swapchain_, &release);
         return;
     }
-    image_acquired_ = true;
+    acquired_ = true;
     VkImage target = images_[index].image;
 
     VkImageMemoryBarrier barriers[2]{};
@@ -579,47 +712,21 @@ void QuestXr::record_present(VkCommandBuffer commands, VkImage image, VkImageLay
 }
 
 void QuestXr::end_frame() {
-    if (image_acquired_) {
-        XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-        ok(xrReleaseSwapchainImage(swapchain_, &release), "xrReleaseSwapchainImage");
-    }
-    if (!frame_begun_) return;
-    XrCompositionLayerCylinderKHR cylinder{XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR};
-    XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
-    const XrCompositionLayerBaseHeader *layers[1]{};
-    std::uint32_t layer_count = 0;
-    if (image_acquired_) {
-        const XrSwapchainSubImage sub{swapchain_, {{0, 0}, {static_cast<std::int32_t>(kPanelWidth),
-                                                            static_cast<std::int32_t>(kPanelHeight)}}, 0};
-        const float aspect = static_cast<float>(kPanelWidth) / static_cast<float>(kPanelHeight);
-        if (cylinder_) {
-            cylinder.space = local_;
-            cylinder.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-            cylinder.subImage = sub;
-            cylinder.pose.orientation.w = 1.0f;
-            cylinder.radius = kScreenRadius;
-            cylinder.centralAngle = kScreenAngle;
-            cylinder.aspectRatio = aspect;
-            layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&cylinder);
-        } else {
-            const float width = kScreenRadius * kScreenAngle;
-            quad.space = local_;
-            quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-            quad.subImage = sub;
-            quad.pose.orientation.w = 1.0f;
-            quad.pose.position.z = -kScreenRadius;
-            quad.size = {width, width / aspect};
-            layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&quad);
-        }
-    }
-    XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};
-    end.displayTime = frame_.predictedDisplayTime;
-    end.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-    end.layerCount = layer_count;
-    end.layers = layers;
-    ok(xrEndFrame(session_, &end), "xrEndFrame");
-    frame_begun_ = false;
-    image_acquired_ = false;
+    if (!acquired_) return;
+    acquired_ = false;
+    VkSemaphore semaphore = semaphores_[next_semaphore_];
+    next_semaphore_ = (next_semaphore_ + 1u) % semaphores_.size();
+    std::lock_guard lock(xr_mutex_);
+    // The runtime's queue waits for the renderer's copy before the runtime
+    // uses the image it is about to be given.
+    const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.waitSemaphoreCount = 1u;
+    submit.pWaitSemaphores = &semaphore;
+    submit.pWaitDstStageMask = &stage;
+    if (vkQueueSubmit(xr_queue_, 1u, &submit, VK_NULL_HANDLE) != VK_SUCCESS) log("the runtime queue's wait failed");
+    XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    if (ok(xrReleaseSwapchainImage(swapchain_, &release), "xrReleaseSwapchainImage")) has_image_.store(true);
 }
 
 QuestXr &quest_xr() {
