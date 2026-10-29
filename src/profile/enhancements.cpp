@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <optional>
@@ -198,6 +199,33 @@ void sixty_fps(psprecomp::GuestMemory &m) {
     }
 }
 
+#if defined(PURE_QUEST_VR)
+// The headset: a race at the PSP's 30 fps (the byte E4 sets to 1 put back to 0 while the backend lives), as Free Play
+// and Time Trial run on the PSP. The game integrates a measured dt, so the race keeps its speed; a stereo frame costs
+// the Quest about 30 ms, and at one vblank a frame (the free-running modes) the race fell to half speed. The headset
+// turns the picture with the head at its own 72 Hz between the game's frames. PURE_VR_RACE_FPS=60 keeps the game's own
+// choice (E4's option) to compare.
+bool vr_thirty_fps() {
+    static const bool thirty = [] {
+        const char *v = env("VR_RACE_FPS");
+        return v == nullptr || std::strcmp(v, "60") != 0;
+    }();
+    return thirty;
+}
+
+void thirty_fps(psprecomp::GuestMemory &m) {
+    if (!race_backend(m)) return;
+    const std::uint32_t frame = m.load32(kFrameObjectPtr);
+    if (frame + kFreeRunning >= kUserEnd || m.load8(frame + kFreeRunning) != 1u) return;
+    m.store8(frame + kFreeRunning, 0u);
+    static bool announced = false;
+    if (!announced) {
+        announced = true;
+        std::cout << "[pure] VR: races at 30 fps (PURE_VR_RACE_FPS=60 for the game's own rate)\n";
+    }
+}
+#endif
+
 // E6: the flash countdown cleared in a free-running frame.
 void smooth_flashes(psprecomp::GuestMemory &m) {
     const std::uint32_t frame = m.load32(kFrameObjectPtr);
@@ -247,6 +275,10 @@ double display_margin() {
 void display_rate(const psprecomp::GuestMemory *m) {
     double hz = 0.0;
     if (settings::game_option("display_rate") == 1u) hz = display_hz();
+#if defined(PURE_QUEST_VR)
+    // The headset's races run at the PSP's 30 fps, two of its vblanks a frame (vr_thirty_fps): the PSP's period.
+    if (vr_thirty_fps()) hz = 0.0;
+#endif
     std::uint64_t period = kVBlankPeriodUs;
     std::uint64_t display_period = 0u;
     enum class State { Off, Outside, Race } state = State::Off;
@@ -291,6 +323,10 @@ void wrap_draw_sync(HleRegistrar &hle) {
         portablekit::gpu::xr::set_scene_3d(race_backend(m));
 #endif
         shield_step::frame(rt);  // task 107: the shield effect's override, once the race runs faster than the PSP
+#if defined(PURE_QUEST_VR)
+        if (vr_thirty_fps()) thirty_fps(m);
+        else
+#endif
         if (settings::game_option("sixty_fps") == 1u) sixty_fps(m);
         if (settings::game_option("smooth_flashes") == 1u) smooth_flashes(m);
         original(rt, ctx);

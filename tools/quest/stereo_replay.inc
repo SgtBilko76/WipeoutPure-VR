@@ -249,6 +249,16 @@ void VulkanRenderer::Impl::replay_eye(VkCommandBuffer commands, Target &target, 
         return text != nullptr && std::strcmp(text, "flat") == 0;
     }();
     static const bool trace_flat = portablekit::env("VR_TRACE_FLAT") != nullptr;
+    // A screen-space draw over (nearly) the whole screen is an effect on the picture (a glare, a tint, a flash):
+    // drawn over the whole eye, not on the interface's rectangle. PURE_VR_FULLSCREEN=hud puts it there, =off leaves
+    // it out.
+    static const int fullscreen_mode = [] {
+        const char *text = portablekit::env("VR_FULLSCREEN");
+        if (text != nullptr && std::strcmp(text, "hud") == 0) return 1;
+        if (text != nullptr && std::strcmp(text, "off") == 0) return 2;
+        return 0;
+    }();
+    std::uint32_t fullscreen = 0u;
     const bool tracing = trace_flat && eye == 0u && stereo_frames % 360u == 0u;
     bool scene_valid = false;
     EyeMatrix scene_clip{}, sprite_transform{};
@@ -295,6 +305,31 @@ void VulkanRenderer::Impl::replay_eye(VkCommandBuffer commands, Target &target, 
         } else if (summary.clear) {
             state.viewport = {0.0f, 0.0f, width, height, min_depth, max_depth};
             state.scissor = all;
+        } else if (const int cover = [&] {
+                       // 1: a screen-space draw over the whole screen; 0: anything else.
+                       if (!summary.through || drawn.raw || drawn.vertex_count == 0u || drawn.vertex_count > 4096u ||
+                           drawn.vertex_base + drawn.vertex_count * sizeof(GpuVertex) > kVertexBufferTotal)
+                           return 0;
+                       const auto *v = reinterpret_cast<const GpuVertex *>(vertices + drawn.vertex_base);
+                       float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+                       for (std::uint32_t i = 0; i < drawn.vertex_count; ++i) {
+                           x0 = std::min(x0, v[i].x), x1 = std::max(x1, v[i].x);
+                           y0 = std::min(y0, v[i].y), y1 = std::max(y1, v[i].y);
+                       }
+                       const bool whole = x1 - x0 >= 0.9f * static_cast<float>(kPspWidth) &&
+                                          y1 - y0 >= 0.9f * static_cast<float>(kPspHeight);
+                       if (tracing)
+                           std::printf("[vr] screen-space draw: %u vertices, box %.0f,%.0f..%.0f,%.0f%s\n",
+                                       drawn.vertex_count, static_cast<double>(x0), static_cast<double>(y0),
+                                       static_cast<double>(x1), static_cast<double>(y1),
+                                       whole ? ": the whole screen" : "");
+                       return whole && fullscreen_mode != 1 ? 1 : 0;
+                   }();
+                   cover != 0) {
+            if (fullscreen_mode == 2) continue;
+            state.viewport = {0.0f, 0.0f, width, height, min_depth, max_depth};
+            state.scissor = all;
+            ++fullscreen;
         } else if (const bool sprite = [&] {
                        // A few screen-space vertices with a depth between the screen's nearest and farthest.
                        if (sprites_flat || !scene_valid || !summary.through || drawn.raw || drawn.vertex_count == 0u ||
@@ -350,8 +385,30 @@ void VulkanRenderer::Impl::replay_eye(VkCommandBuffer commands, Target &target, 
             ++sprites;
             if (!sprite_valid) continue;
         } else {
-            if (tracing && summary.through)
-                std::printf("[vr] flat draw: %u vertices (interface)\n", drawn.vertex_count);
+            if (tracing && !summary.through) {
+                // Where the game's own transform puts the draw's first vertex on the PSP's screen, and its depth.
+                float sx = 0.0f, sy = 0.0f, sz = 0.0f;
+                if (!drawn.raw && drawn.vertex_count != 0u &&
+                    drawn.vertex_base + sizeof(GpuVertex) <= kVertexBufferTotal) {
+                    const auto *v = reinterpret_cast<const GpuVertex *>(vertices + drawn.vertex_base);
+                    const EyeMatrix m = interpolation::multiply(summary.projection,
+                                                                interpolation::multiply(summary.view, summary.world));
+                    const float cx = m[0] * v->x + m[4] * v->y + m[8] * v->z + m[12];
+                    const float cy = m[1] * v->x + m[5] * v->y + m[9] * v->z + m[13];
+                    const float cz = m[2] * v->x + m[6] * v->y + m[10] * v->z + m[14];
+                    const float cw = m[3] * v->x + m[7] * v->y + m[11] * v->z + m[15];
+                    if (cw != 0.0f) {
+                        sx = (cx / cw + 1.0f) * 0.5f * static_cast<float>(kPspWidth);
+                        sy = (cy / cw + 1.0f) * 0.5f * static_cast<float>(kPspHeight);
+                        sz = cz / cw * summary.z_scale + summary.z_offset;
+                    }
+                }
+                std::printf("[vr] flat draw: %u vertices, transformed (%s), first at %.0f,%.0f depth %.0f, "
+                            "texture 0x%x\n",
+                            drawn.vertex_count, summary.perspective ? "perspective" : "orthographic",
+                            static_cast<double>(sx), static_cast<double>(sy), static_cast<double>(sz),
+                            summary.texture_address);
+            }
             state.viewport = {hud_left, hud_top, hud_right - hud_left, hud_bottom - hud_top, min_depth, max_depth};
             const float x0 = std::clamp(hud_left + static_cast<float>(drawn.state.scissor.offset.x) * scissor_x, 0.0f, width);
             const float y0 = std::clamp(hud_top + static_cast<float>(drawn.state.scissor.offset.y) * scissor_y, 0.0f, height);
@@ -402,9 +459,9 @@ void VulkanRenderer::Impl::replay_eye(VkCommandBuffer commands, Target &target, 
     // Every five seconds or so: what the eyes drew, and the numbers that say
     // whether the game's eye space was read right and how big its units are.
     if (eye == 0u && stereo_frames++ % 360u == 0u) {
-        std::printf("[vr] stereo: %u 3D, %u sprite and %u flat draw calls, eye %ux%u, nearest 3D object %.2f units away, "
+        std::printf("[vr] stereo: %u 3D, %u full-screen, %u sprite and %u flat draw calls, eye %ux%u, nearest 3D object %.2f units away, "
                     "%.3g units a metre, interface %.0f..%.0f x %.0f..%.0f\n",
-                    perspective, sprites, flat, target.extent.width, target.extent.height, static_cast<double>(nearest),
+                    perspective, fullscreen, sprites, flat, target.extent.width, target.extent.height, static_cast<double>(nearest),
                     static_cast<double>(scale), static_cast<double>(hud_left), static_cast<double>(hud_right),
                     static_cast<double>(hud_top), static_cast<double>(hud_bottom));
         for (const interpolation::DrawSummary &summary : frame.summaries) {
