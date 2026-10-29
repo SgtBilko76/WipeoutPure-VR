@@ -119,14 +119,24 @@ stubs="$llvm/../sysroot/usr/lib/aarch64-linux-android/$MIN_SDK"
         "$llvm/llvm-nm" -D --defined-only "$stubs/$system.so"
     done
     "$llvm/llvm-nm" -D --defined-only "$lib"/*.so
-} 2> /dev/null | awk 'NF >= 3 { sub(/@.*/, "", $3); print $3 }' | sort -u > "$work/exports.txt"
+} 2> /dev/null | awk 'NF >= 3 { sub(/@.*/, "", $3); print $3 }' | LC_ALL=C sort -u > "$work/exports.txt"
 missing="$("$llvm/llvm-nm" -D --undefined-only "$lib"/*.so | awk '$1 == "U" { sub(/@.*/, "", $2); print $2 }' |
-    sort -u | comm -23 - "$work/exports.txt")"
+    LC_ALL=C sort -u | LC_ALL=C comm -23 - "$work/exports.txt")"
 if [[ -n "$missing" ]]; then
     echo "error: the libraries import what Android $MIN_SDK lacks:" $missing >&2
     exit 1
 fi
-(cd "$work" && cp dex/classes.dex . && zip -q unsigned.apk classes.dex && zip -q -r -9 unsigned.apk lib)
+(cd "$work" && cp dex/classes.dex . && python3 - unsigned.apk classes.dex lib <<'EOF'
+# Appends to the APK aapt2 made (a `zip` on PATH may be something else).
+import os, sys, zipfile
+with zipfile.ZipFile(sys.argv[1], "a", zipfile.ZIP_DEFLATED, compresslevel=9) as apk:
+    for item in sys.argv[2:]:
+        paths = [item] if os.path.isfile(item) else sorted(
+            os.path.join(d, f) for d, _, files in os.walk(item) for f in files)
+        for path in paths:
+            apk.write(path, path)
+EOF
+)
 
 echo "aligning and signing"
 keystore="${KEYSTORE:-$HOME/.android/debug.keystore}"
