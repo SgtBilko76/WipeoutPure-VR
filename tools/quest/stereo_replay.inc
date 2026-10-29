@@ -146,11 +146,14 @@ void VulkanRenderer::Impl::finish_stereo_frame(std::uint32_t displayed) {
 
 // In the frame's own command buffer, outside a render pass: the two eye
 // images, handed to the headset.
-void VulkanRenderer::Impl::record_stereo(VkCommandBuffer commands) {
-    if (!stereo_ready || !newer_frame.valid || !newer_frame.recorded) return;
+// Before the frame's submit: whether its eyes are drawn (the headset located them and gave two images). The
+// frame then leaves the screen's copy out: the headset shows the eyes.
+bool VulkanRenderer::Impl::begin_stereo() {
+    stereo_begun = false;
+    if (!stereo_ready || !newer_frame.valid || !newer_frame.recorded) return false;
     stereo_ready = false;
     const VkExtent2D extent = xr::bridge()->stereo_extent();
-    if (extent.width == 0u || extent.height == 0u) return;
+    if (extent.width == 0u || extent.height == 0u) return false;
     for (Target &target : eye_targets) {
         if (target.color != VK_NULL_HANDLE) continue;
         target = Target{};
@@ -159,46 +162,84 @@ void VulkanRenderer::Impl::record_stereo(VkCommandBuffer commands) {
         if (!create_target(target, error)) {
             std::cout << "[vr] no room for the eye images: " << error << "\n";
             destroy_target(target);
-            return;
+            return false;
         }
     }
-    xr::StereoFrame stereo{};
-    if (!xr::bridge()->stereo_begin(stereo)) return;
-    // The eye passes' GPU time: this slot's last pair has finished (begin_frame waited for its fence).
+    if (!xr::bridge()->stereo_begin(stereo_frame)) return false;
+    stereo_begun = true;
+    return true;
+}
+
+// After the frame's submit: the eyes in a submit of their own, on one of the present slots (whose fences the
+// renderer already waits for before it reuses a vertex region or frees a texture they may draw from). The frame's
+// fence then covers the game's own work only, so the write-backs the next frame waits for do not wait for the eyes.
+void VulkanRenderer::Impl::submit_stereo() {
+    if (!stereo_begun) return;
+    stereo_begun = false;
+    const std::uint32_t p = present_slot;
+    present_slot ^= 1u;
+    VkCommandBuffer commands = present_commands[p];
+    VkFence fence = present_fences[p];
+    const perf::Clock::time_point wait_start = perf::Clock::now();
+    wait_fence(fence, "the wait for the eyes before");
+    perf::add_wait_time(perf::Clock::now() - wait_start, perf::Stall::Fence);
     if (eye_timer == VK_NULL_HANDLE && gpu_timer != VK_NULL_HANDLE) {
         VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
         info.queryType = VK_QUERY_TYPE_TIMESTAMP;
-        info.queryCount = 2u * kMaxSlots;
+        info.queryCount = 4u;
         if (vkCreateQueryPool(device, &info, nullptr, &eye_timer) != VK_SUCCESS) eye_timer = VK_NULL_HANDLE;
     }
-    if (eye_timer != VK_NULL_HANDLE && eye_timed[slot]) {
+    // This present slot's last pair has finished: its fence was just waited for.
+    if (eye_timer != VK_NULL_HANDLE && eye_timed[p]) {
         std::array<std::uint64_t, 2> ticks{};
-        if (vkGetQueryPoolResults(device, eye_timer, slot * 2u, 2u, sizeof(ticks), ticks.data(), sizeof(std::uint64_t),
+        if (vkGetQueryPoolResults(device, eye_timer, p * 2u, 2u, sizeof(ticks), ticks.data(), sizeof(std::uint64_t),
                                   VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
             eye_gpu_ms += static_cast<double>((ticks[1] - ticks[0]) & gpu_timer_mask) * gpu_timer_ns_per_tick / 1.0e6;
             ++eye_gpu_samples;
         }
-        eye_timed[slot] = false;
+        eye_timed[p] = false;
     }
+    vkResetFences(device, 1u, &fence);
+    vkResetCommandBuffer(commands, 0u);
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(commands, &begin);
     if (eye_timer != VK_NULL_HANDLE) {
-        vkCmdResetQueryPool(commands, eye_timer, slot * 2u, 2u);
-        vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, eye_timer, slot * 2u);
+        vkCmdResetQueryPool(commands, eye_timer, p * 2u, 2u);
+        vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, eye_timer, p * 2u);
     }
+    // The vertex regions the eyes read, so the frames after do not overwrite them before the eyes are drawn.
+    std::uint32_t regions = 0u;
+    for (const ReplayGroup &drawn : newer_frame.groups)
+        if (drawn.vertex_base < static_cast<VkDeviceSize>(kFrameRegions) * kVertexBufferBytes)
+            regions |= 1u << static_cast<std::uint32_t>(drawn.vertex_base / kVertexBufferBytes);
+    present_regions[p] = regions;
     std::array<VkImage, 2> images{};
     for (std::uint32_t eye = 0; eye < 2u; ++eye) {
-        replay_eye(commands, eye_targets[eye], stereo, eye);
+        replay_eye(commands, eye_targets[eye], stereo_frame, eye);
         transition(commands, eye_targets[eye].color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         images[eye] = eye_targets[eye].color;
     }
     if (eye_timer != VK_NULL_HANDLE) {
-        vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, eye_timer, slot * 2u + 1u);
-        eye_timed[slot] = true;
+        vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, eye_timer, p * 2u + 1u);
+        eye_timed[p] = true;
     }
+    const VkExtent2D extent = eye_targets[0].extent;
     xr::bridge()->record_stereo(commands, images, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, extent);
     for (const Target &target : eye_targets)
         transition(commands, target.color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    vkEndCommandBuffer(commands);
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = 1u;
+    submit.pCommandBuffers = &commands;
+    VkSemaphore signal = xr::bridge()->frame_semaphore();
+    if (signal != VK_NULL_HANDLE) {
+        submit.signalSemaphoreCount = 1u;
+        submit.pSignalSemaphores = &signal;
+    }
+    if (vkQueueSubmit(queue, 1u, &submit, fence) == VK_ERROR_DEVICE_LOST) device_lost("the eyes' submit");
 }
 
 void VulkanRenderer::Impl::replay_eye(VkCommandBuffer commands, Target &target, const xr::StereoFrame &stereo,

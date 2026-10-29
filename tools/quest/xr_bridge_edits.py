@@ -207,9 +207,14 @@ edit(R, "#if defined(__ANDROID__)\n"
         "        else\n"
         "#endif\n"
         "            transition(commands, target, layout, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);\n",
+     "        // The eyes, when the frame is a 3D scene and the port's menu is closed: drawn in a submit after this\n"
+     "        // one (submit_stereo), and the headset shows them instead of the screen, which is not copied then.\n"
+     "        const bool eyes = xr && main_frame && game_frame && !draw_ui && begin_stereo();\n"
      "        if (xr) {\n"
      "            transition(commands, target, layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);\n"
-     "            xr::bridge()->record_present(commands, target, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, swapchain_extent);\n"
+     "            if (!eyes)\n"
+     "                xr::bridge()->record_present(commands, target, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,\n"
+     "                                             swapchain_extent);\n"
      "        } else\n"
      "#if defined(__ANDROID__)\n"
      "        if (prerotated() && image_index < upright_images.size()) record_rotation(commands, image_index, layout);\n"
@@ -218,7 +223,7 @@ edit(R, "#if defined(__ANDROID__)\n"
      "            transition(commands, target, layout, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);\n")
 edit(R, "    if (can_present) {\n        submit.waitSemaphoreCount = 1u;\n",
      "    // The headset's copy of the frame waits for this submit (xr_bridge.hpp).\n"
-     "    VkSemaphore xr_signal = xr && can_present ? xr::bridge()->frame_semaphore() : VK_NULL_HANDLE;\n"
+     "    VkSemaphore xr_signal = xr && can_present && !stereo_begun ? xr::bridge()->frame_semaphore() : VK_NULL_HANDLE;\n"
      "    if (xr_signal != VK_NULL_HANDLE) {\n"
      "        submit.signalSemaphoreCount = 1u;\n"
      "        submit.pSignalSemaphores = &xr_signal;\n"
@@ -242,7 +247,10 @@ edit(R, "    const float priority = 1.0f;\n"
 edit(R, "    display_hz = refresh;\n    perf::set_display_info(",
      "    if (xr) refresh = xr::bridge()->refresh_rate();\n    display_hz = refresh;\n    perf::set_display_info(")
 edit(R, "    if (can_present) {\n        VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};\n",
-     "    if (xr) xr::bridge()->end_frame();\n"
+     "    if (xr) {\n"
+     "        submit_stereo();  // the eyes, after the frame (begin_stereo)\n"
+     "        xr::bridge()->end_frame();\n"
+     "    }\n"
      "    if (can_present && !xr) {\n        VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};\n")
 
 # No frame interpolation into a headset: the runtime paces and reprojects.
@@ -398,12 +406,15 @@ edit(R, "    void replay(VkCommandBuffer commands, std::uint32_t slot, float t);
      "    bool stereo_ready{};  // newer_frame is the frame being presented, recorded for the eyes\n"
      "    std::uint64_t stereo_frames{};\n"
      "    VkQueryPool eye_timer{};  // the eye passes' GPU time, a pair per frame slot\n"
-     "    std::array<bool, kMaxSlots> eye_timed{};\n"
+     "    std::array<bool, 2> eye_timed{};  // by present slot\n"
+     "    xr::StereoFrame stereo_frame{};\n"
+     "    bool stereo_begun{};  // the frame being submitted has its eyes drawn after it (submit_stereo)\n"
      "    double eye_gpu_ms{};\n"
      "    std::uint32_t eye_gpu_samples{};\n"
      "    [[nodiscard]] bool stereo_wanted() const;\n"
      "    void finish_stereo_frame(std::uint32_t displayed);\n"
-     "    void record_stereo(VkCommandBuffer commands);\n"
+     "    bool begin_stereo();\n"
+     "    void submit_stereo();\n"
      "    void replay_eye(VkCommandBuffer commands, Target &target, const xr::StereoFrame &stereo, std::uint32_t eye);\n")
 
 stereo_code = pathlib.Path(__file__).with_name("stereo_replay.inc").read_text()
@@ -423,11 +434,6 @@ edit(R, "    // The game's frame as it is, at its flip.\n"
      "        // The game's frame as it is, at its flip.\n"
      "        impl.reset_interpolation();\n"
      "    }\n")
-
-edit(R, "        if (xr) {\n            transition(commands, target, layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);\n",
-     "        // The eyes' pictures first, when the frame is a 3D scene and the port's menu is closed.\n"
-     "        if (xr && main_frame && game_frame && !draw_ui) record_stereo(commands);\n"
-     "        if (xr) {\n            transition(commands, target, layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);\n")
 
 edit(R, "    for (Target &target : blend_targets) destroy_target(target);\n"
         "    older_picture_valid = newer_picture_valid = false;\n",

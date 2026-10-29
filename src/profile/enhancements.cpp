@@ -276,8 +276,9 @@ void display_rate(const psprecomp::GuestMemory *m) {
     double hz = 0.0;
     if (settings::game_option("display_rate") == 1u) hz = display_hz();
 #if defined(PURE_QUEST_VR)
-    // The headset's races run at the PSP's 30 fps, two of its vblanks a frame (vr_thirty_fps): the PSP's period.
-    if (vr_thirty_fps()) hz = 0.0;
+    // The headset keeps the PSP's vblank: races at its 30 fps (vr_thirty_fps) or 59.94 (PURE_VR_RACE_FPS=60); the
+    // headset turns the picture with the head at its own refresh between the game's frames.
+    hz = 0.0;
 #endif
     std::uint64_t period = kVBlankPeriodUs;
     std::uint64_t display_period = 0u;
