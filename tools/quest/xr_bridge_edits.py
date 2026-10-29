@@ -381,10 +381,15 @@ FI_H = "host/gpu/frame_interpolation.hpp"
 FI_C = "host/gpu/frame_interpolation.cpp"
 edit(FI_H, "    bool skinned{};  // the vertices were blended by bone matrices\n",
      "    bool skinned{};  // the vertices were blended by bone matrices\n"
-     "    bool clear{};    // a clear-mode draw (a headset's stereo view clears the whole eye with it)\n")
+     "    bool clear{};    // a clear-mode draw (a headset's stereo view clears the whole eye with it)\n"
+     "    bool through{};  // screen-space vertices\n"
+     "    float z_scale{}, z_offset{};  // the GE viewport's depth scale and offset\n")
 edit(FI_C, "    draw.transformed = !call.through && !call.clear_mode;\n",
      "    draw.transformed = !call.through && !call.clear_mode;\n"
-     "    draw.clear = call.clear_mode;\n")
+     "    draw.clear = call.clear_mode;\n"
+     "    draw.through = call.through;\n"
+     "    draw.z_scale = call.viewport.z_scale;\n"
+     "    draw.z_offset = call.viewport.z_offset;\n")
 
 edit(R, "    void replay(VkCommandBuffer commands, std::uint32_t slot, float t);\n",
      "    void replay(VkCommandBuffer commands, std::uint32_t slot, float t);\n"
@@ -425,5 +430,14 @@ edit(R, "    for (Target &target : blend_targets) destroy_target(target);\n"
      "    for (Target &target : blend_targets) destroy_target(target);\n"
      "    for (Target &target : eye_targets) destroy_target(target);\n"
      "    older_picture_valid = newer_picture_valid = false;\n")
+
+V = "host/gpu/shaders/ge.vert"
+edit(V, "        vec2 ndc = vec2(in_position.x / push.viewport.x, in_position.y / push.viewport.y) * 2.0 - 1.0;\n"
+        "        gl_Position = vec4(ndc, clamp(in_position.z / 65535.0, 0.0, 1.0), 1.0);\n",
+     "        vec2 ndc = vec2(in_position.x / push.viewport.x, in_position.y / push.viewport.y) * 2.0 - 1.0;\n"
+     "        gl_Position = vec4(ndc, clamp(in_position.z / 65535.0, 0.0, 1.0), 1.0);\n"
+     "        // A headset's eye: the screen-space vertex taken back into the scene and seen from the eye\n"
+     "        // (xr_bridge.hpp; the matrix gives device depth times w in z).\n"
+     "        if (push.viewport.z > 1.5) gl_Position = push.transform * vec4(in_position.xyz, 1.0);\n")
 
 print("changed:", sorted(set(changed)) or "nothing (already applied)")

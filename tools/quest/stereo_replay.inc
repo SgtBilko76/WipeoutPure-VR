@@ -81,6 +81,47 @@ EyeMatrix eye_projection(const EyeMatrix &clip, const EyeAxes &axes, const xr::E
     return p;
 }
 
+// The inverse of a 4x4 matrix (column-major), or false when it has none.
+bool invert(const EyeMatrix &m, EyeMatrix &out) {
+    EyeMatrix inv{};
+    inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] +
+             m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+    inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] -
+             m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+    inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] +
+             m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+    inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] -
+              m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+    inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] -
+             m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+    inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] +
+             m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+    inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] -
+             m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+    inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] +
+              m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+    inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] +
+             m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+    inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] -
+             m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+    inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] +
+              m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+    inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] -
+              m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+    inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] -
+             m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+    inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] +
+             m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+    inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] -
+              m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+    inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] +
+              m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+    const float det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+    if (std::fabs(det) < 1e-20f) return false;
+    for (std::size_t i = 0; i < 16u; ++i) out[i] = inv[i] / det;
+    return true;
+}
+
 } // namespace
 
 bool VulkanRenderer::Impl::stereo_wanted() const {
@@ -198,8 +239,22 @@ void VulkanRenderer::Impl::replay_eye(VkCommandBuffer commands, Target &target, 
     bool known = false;
     EyeMatrix last_view{}, last_world{}, last_clip{}, eye_space{}, transform{};
     bool cached = false;
-    std::uint32_t perspective = 0u, flat = 0u;
+    std::uint32_t perspective = 0u, flat = 0u, sprites = 0u;
     float nearest = 0.0f;
+    // The scene's projection, from the last 3D draw: a screen-space sprite the game projected itself (a light's
+    // glow, a flare) is taken back into the scene through it and drawn where the eye sees that place.
+    // PURE_VR_SPRITES=flat leaves them on the interface's rectangle; PURE_VR_TRACE_FLAT lists the flat draws.
+    static const bool sprites_flat = [] {
+        const char *text = portablekit::env("VR_SPRITES");
+        return text != nullptr && std::strcmp(text, "flat") == 0;
+    }();
+    static const bool trace_flat = portablekit::env("VR_TRACE_FLAT") != nullptr;
+    const bool tracing = trace_flat && eye == 0u && stereo_frames % 360u == 0u;
+    bool scene_valid = false;
+    EyeMatrix scene_clip{}, sprite_transform{};
+    float scene_z_scale = 0.0f, scene_z_offset = 0.0f;
+    bool sprite_valid = false;
+    const auto *vertices = static_cast<const std::uint8_t *>(vertex_mapped);
     for (const ReplayGroup &drawn : frame.groups) {
         if (drawn.target != frame.displayed) continue;
         DrawState state = drawn.state;
@@ -226,13 +281,77 @@ void VulkanRenderer::Impl::replay_eye(VkCommandBuffer commands, Target &target, 
             state.viewport = {0.0f, 0.0f, width, height, min_depth, max_depth};
             state.scissor = all;
             ++perspective;
+            if (!scene_valid || summary.projection != scene_clip || summary.z_scale != scene_z_scale ||
+                summary.z_offset != scene_z_offset) {
+                scene_clip = summary.projection;
+                scene_z_scale = summary.z_scale;
+                scene_z_offset = summary.z_offset;
+                scene_valid = scene_z_scale != 0.0f;
+                sprite_valid = false;
+            }
             const auto &t = summary.eye_translation;
             const float distance = std::sqrt(t[0] * t[0] + t[1] * t[1] + t[2] * t[2]);
             if (nearest == 0.0f || distance < nearest) nearest = distance;
         } else if (summary.clear) {
             state.viewport = {0.0f, 0.0f, width, height, min_depth, max_depth};
             state.scissor = all;
+        } else if (const bool sprite = [&] {
+                       // A few screen-space vertices with a depth between the screen's nearest and farthest.
+                       if (sprites_flat || !scene_valid || !summary.through || drawn.raw || drawn.vertex_count == 0u ||
+                           drawn.vertex_count > 32u ||
+                           drawn.vertex_base + drawn.vertex_count * sizeof(GpuVertex) > kVertexBufferTotal)
+                           return false;
+                       const auto *v = reinterpret_cast<const GpuVertex *>(vertices + drawn.vertex_base);
+                       float low = 65535.0f, high = 0.0f;
+                       for (std::uint32_t i = 0; i < drawn.vertex_count; ++i) {
+                           low = std::min(low, v[i].z);
+                           high = std::max(high, v[i].z);
+                       }
+                       const bool deep = low > 0.5f && high < 65534.5f;
+                       if (tracing)
+                           std::printf("[vr] flat draw: %u vertices at %.0f,%.0f, z %.0f..%.0f: %s\n",
+                                       drawn.vertex_count, static_cast<double>(v[0].x), static_cast<double>(v[0].y),
+                                       static_cast<double>(low), static_cast<double>(high), deep ? "sprite" : "flat");
+                       return deep;
+                   }();
+                   sprite) {
+            if (!sprite_valid) {
+                // Screen pixels and depth to the game's clip space, back to its eye space, to this eye's clip space,
+                // and its z to the device depth (times w) the GE's depth range gives.
+                EyeMatrix to_clip{};
+                to_clip[0] = 2.0f / static_cast<float>(kPspWidth);
+                to_clip[5] = 2.0f / static_cast<float>(kPspHeight);
+                to_clip[10] = 1.0f / scene_z_scale;
+                to_clip[12] = -1.0f;
+                to_clip[13] = -1.0f;
+                to_clip[14] = -scene_z_offset / scene_z_scale;
+                to_clip[15] = 1.0f;
+                EyeMatrix from_clip{};
+                if (invert(scene_clip, from_clip)) {
+                    const EyeAxes axes = eye_axes(scene_clip);
+                    const EyeMatrix flip{axes.x, 0.0f, 0.0f, 0.0f, 0.0f, axes.y, 0.0f, 0.0f,
+                                         0.0f, 0.0f, axes.z, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f};
+                    EyeMatrix depth{};
+                    depth[0] = depth[5] = depth[15] = 1.0f;
+                    depth[10] = scene_z_scale / 65535.0f;
+                    depth[14] = scene_z_offset / 65535.0f;
+                    const EyeMatrix head = interpolation::multiply(flip, interpolation::multiply(from_reference, flip));
+                    sprite_transform = interpolation::multiply(
+                        depth, interpolation::multiply(
+                                   eye_projection(scene_clip, axes, view),
+                                   interpolation::multiply(head, interpolation::multiply(from_clip, to_clip))));
+                    sprite_valid = true;
+                }
+            }
+            state.push.transform = sprite_transform;
+            state.push.viewport[2] = 2.0f;  // ge.vert: a through draw placed by the transform
+            state.viewport = {0.0f, 0.0f, width, height, 0.0f, 1.0f};
+            state.scissor = all;
+            ++sprites;
+            if (!sprite_valid) continue;
         } else {
+            if (tracing && summary.through)
+                std::printf("[vr] flat draw: %u vertices (interface)\n", drawn.vertex_count);
             state.viewport = {hud_left, hud_top, hud_right - hud_left, hud_bottom - hud_top, min_depth, max_depth};
             const float x0 = std::clamp(hud_left + static_cast<float>(drawn.state.scissor.offset.x) * scissor_x, 0.0f, width);
             const float y0 = std::clamp(hud_top + static_cast<float>(drawn.state.scissor.offset.y) * scissor_y, 0.0f, height);
@@ -283,9 +402,9 @@ void VulkanRenderer::Impl::replay_eye(VkCommandBuffer commands, Target &target, 
     // Every five seconds or so: what the eyes drew, and the numbers that say
     // whether the game's eye space was read right and how big its units are.
     if (eye == 0u && stereo_frames++ % 360u == 0u) {
-        std::printf("[vr] stereo: %u 3D and %u flat draw calls, eye %ux%u, nearest 3D object %.2f units away, "
+        std::printf("[vr] stereo: %u 3D, %u sprite and %u flat draw calls, eye %ux%u, nearest 3D object %.2f units away, "
                     "%.3g units a metre, interface %.0f..%.0f x %.0f..%.0f\n",
-                    perspective, flat, target.extent.width, target.extent.height, static_cast<double>(nearest),
+                    perspective, sprites, flat, target.extent.width, target.extent.height, static_cast<double>(nearest),
                     static_cast<double>(scale), static_cast<double>(hud_left), static_cast<double>(hud_right),
                     static_cast<double>(hud_top), static_cast<double>(hud_bottom));
         for (const interpolation::DrawSummary &summary : frame.summaries) {

@@ -184,6 +184,8 @@ private:
     bool cylinder_{};
     bool pico_{};
     bool refresh_ext_{};
+    bool perf_ext_{};
+    PFN_xrPerfSettingsSetPerformanceLevelEXT set_performance_level_{};
 
     PFN_xrGetVulkanInstanceExtensionsKHR get_instance_extensions_{};
     PFN_xrGetVulkanDeviceExtensionsKHR get_device_extensions_{};
@@ -281,6 +283,8 @@ bool QuestXr::prepare() {
     if (pico_) enabled.push_back(XR_BD_CONTROLLER_INTERACTION_EXTENSION_NAME);
     refresh_ext_ = has_extension(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
     if (refresh_ext_) enabled.push_back(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
+    perf_ext_ = has_extension(XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME);
+    if (perf_ext_) enabled.push_back(XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME);
 
     XrInstanceCreateInfoAndroidKHR android{XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR};
     android.applicationVM = vm;
@@ -308,6 +312,7 @@ bool QuestXr::prepare() {
         !get("xrGetVulkanGraphicsRequirementsKHR", get_graphics_requirements_))
         return false;
     if (refresh_ext_ && !get("xrGetDisplayRefreshRateFB", get_refresh_rate_)) refresh_ext_ = false;
+    if (perf_ext_ && !get("xrPerfSettingsSetPerformanceLevelEXT", set_performance_level_)) perf_ext_ = false;
     XrInstanceProperties instance_properties{XR_TYPE_INSTANCE_PROPERTIES};
     xrGetInstanceProperties(instance_, &instance_properties);
     log("OpenXR runtime %s %u.%u.%u, cylinder layer %s, PICO controllers %s", instance_properties.runtimeName,
@@ -415,6 +420,22 @@ bool QuestXr::start(VkInstance instance, VkPhysicalDevice physical_device, VkDev
         if (XR_SUCCEEDED(get_refresh_rate_(session_, &rate)) && rate > 0.0f) refresh_.store(rate);
     }
     log("display refresh %.0f Hz", static_cast<double>(refresh_.load()));
+    // The headset's frames never come late (the frame loop has a thread of its own), so the system would keep
+    // the clocks low while the game's thread works hard: the levels are asked for instead. PURE_VR_PERF_LEVEL:
+    // boost, high (the default), low or powersave.
+    if (perf_ext_) {
+        XrPerfSettingsLevelEXT level = XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT;
+        const char *named = std::getenv("PURE_VR_PERF_LEVEL");
+        if (named != nullptr && std::strcmp(named, "boost") == 0) level = XR_PERF_SETTINGS_LEVEL_BOOST_EXT;
+        if (named != nullptr && std::strcmp(named, "low") == 0) level = XR_PERF_SETTINGS_LEVEL_SUSTAINED_LOW_EXT;
+        if (named != nullptr && std::strcmp(named, "powersave") == 0) level = XR_PERF_SETTINGS_LEVEL_POWER_SAVINGS_EXT;
+        const bool cpu = ok(set_performance_level_(session_, XR_PERF_SETTINGS_DOMAIN_CPU_EXT, level), "CPU level");
+        const bool gpu = ok(set_performance_level_(session_, XR_PERF_SETTINGS_DOMAIN_GPU_EXT, level), "GPU level");
+        log("performance level %d for the CPU (%s) and the GPU (%s)", static_cast<int>(level), cpu ? "set" : "refused",
+            gpu ? "set" : "refused");
+    } else {
+        log("no %s: the system picks the clocks", XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME);
+    }
     if (!create_eye_swapchains()) {
         eye_extent_ = {};
         log("no stereo: the race stays on the screen");
