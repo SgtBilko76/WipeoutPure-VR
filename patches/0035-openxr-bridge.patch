@@ -342,7 +342,7 @@ index 0000000..55ee545
 +
 +} // namespace portablekit::gpu::xr
 diff --git a/host/platform/android_app.cpp b/host/platform/android_app.cpp
-index f5c6539..7805600 100644
+index f5c6539..fd05073 100644
 --- a/host/platform/android_app.cpp
 +++ b/host/platform/android_app.cpp
 @@ -11,6 +11,9 @@
@@ -355,7 +355,7 @@ index f5c6539..7805600 100644
  
  #include <cstdint>
  #include <cstdio>
-@@ -85,10 +88,82 @@ void unpack_bundled_fonts() {
+@@ -85,10 +88,91 @@ void unpack_bundled_fonts() {
      portablekit::set_bundled_resource_directory(root);
  }
  
@@ -410,12 +410,21 @@ index f5c6539..7805600 100644
 +    std::error_code ec;
 +    std::filesystem::create_directories(root / "import", ec);
 +    std::filesystem::create_directories(root / "game" / "ms0" / "PSP" / "SAVEDATA", ec);
-+    std::vector<std::filesystem::path> archives;
-+    for (const auto &entry : std::filesystem::directory_iterator(root / "import", ec))
-+        if (entry.path().extension() == ".tar") archives.push_back(entry.path());
-+    for (const std::filesystem::path &archive : archives) {
-+        if (unpack_tar(archive, root)) std::filesystem::remove(archive, ec);
-+        else std::printf("[android] cannot unpack %s\n", archive.c_str());
++    // Every step logged and nothing thrown out of here: this runs before the game, on SDL's thread.
++    try {
++        std::vector<std::filesystem::path> archives;
++        std::filesystem::directory_iterator it(root / "import", ec), end;
++        for (; !ec && it != end; it.increment(ec))
++            if (it->path().extension() == ".tar") archives.push_back(it->path());
++        if (ec) std::printf("[android] cannot list %s: %s\n", (root / "import").c_str(), ec.message().c_str());
++        for (const std::filesystem::path &archive : archives) {
++            std::printf("[android] unpacking %s\n", archive.c_str());
++            std::fflush(stdout);
++            if (unpack_tar(archive, root)) std::filesystem::remove(archive, ec);
++            else std::printf("[android] cannot unpack %s\n", archive.c_str());
++        }
++    } catch (const std::exception &e) {
++        std::printf("[android] unpacking the imports failed: %s\n", e.what());
 +    }
 +    setenv(portablekit::env_name("DATA_DIR").c_str(), root.c_str(), 0);
 +    const std::filesystem::path game = root / "game";
