@@ -189,7 +189,12 @@ edit(R, "                                              VkExtent2D source_extent,
 edit(R, "    VkResult acquired = VK_ERROR_OUT_OF_DATE_KHR;\n    if (acquired_image) {\n        image_index = *acquired_image;\n",
      "    VkResult acquired = VK_ERROR_OUT_OF_DATE_KHR;\n"
      "    if (xr) {\n"
-     "        // The runtime paces the frame (xrWaitFrame); one of the panel images takes it.\n"
+     "        // The headset's refresh can change while the game runs (72, 90, 120 Hz): the game's pace follows it.\n"
+     "        if (const float hz = xr::bridge()->refresh_rate(); hz > 0.0f && hz != display_hz) {\n"
+     "            display_hz = hz;\n"
+     "            perf::set_display_info(\"OpenXR\", swapchain_extent.width, swapchain_extent.height, hz);\n"
+     "        }\n"
+     "        // The headset's own thread shows the frame; one of the panel images takes it.\n"
      "        if (xr::bridge()->begin_frame() && has_content && !swapchain_images.empty()) {\n"
      "            image_index = xr_next_image;\n"
      "            xr_next_image = (xr_next_image + 1u) % static_cast<std::uint32_t>(swapchain_images.size());\n"

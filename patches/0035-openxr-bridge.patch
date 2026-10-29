@@ -1,5 +1,5 @@
 diff --git a/host/gpu/vulkan_renderer.cpp b/host/gpu/vulkan_renderer.cpp
-index ef4fcb8..64cadec 100644
+index ef4fcb8..9f1b443 100644
 --- a/host/gpu/vulkan_renderer.cpp
 +++ b/host/gpu/vulkan_renderer.cpp
 @@ -5,6 +5,7 @@
@@ -221,13 +221,18 @@ index ef4fcb8..64cadec 100644
  #endif
      if (!acquired_image) {
          check_swapchain();
-@@ -3561,7 +3663,15 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
+@@ -3561,7 +3663,20 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
  
      std::uint32_t image_index = 0u;
      VkResult acquired = VK_ERROR_OUT_OF_DATE_KHR;
 -    if (acquired_image) {
 +    if (xr) {
-+        // The runtime paces the frame (xrWaitFrame); one of the panel images takes it.
++        // The headset's refresh can change while the game runs (72, 90, 120 Hz): the game's pace follows it.
++        if (const float hz = xr::bridge()->refresh_rate(); hz > 0.0f && hz != display_hz) {
++            display_hz = hz;
++            perf::set_display_info("OpenXR", swapchain_extent.width, swapchain_extent.height, hz);
++        }
++        // The headset's own thread shows the frame; one of the panel images takes it.
 +        if (xr::bridge()->begin_frame() && has_content && !swapchain_images.empty()) {
 +            image_index = xr_next_image;
 +            xr_next_image = (xr_next_image + 1u) % static_cast<std::uint32_t>(swapchain_images.size());
@@ -238,7 +243,7 @@ index ef4fcb8..64cadec 100644
          image_index = *acquired_image;
          acquired = VK_SUCCESS;
          acquired_image.reset();
-@@ -3645,6 +3755,10 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
+@@ -3645,6 +3760,10 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
                  capture = true;
              }
          }
@@ -249,7 +254,7 @@ index ef4fcb8..64cadec 100644
  #if defined(__ANDROID__)
          if (prerotated() && image_index < upright_images.size()) record_rotation(commands, image_index, layout);
          else
-@@ -3658,7 +3772,13 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
+@@ -3658,7 +3777,13 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
      VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
      submit.commandBufferCount = frame_batch(commands, batch);
      submit.pCommandBuffers = batch.data();
@@ -264,7 +269,7 @@ index ef4fcb8..64cadec 100644
          submit.waitSemaphoreCount = 1u;
          submit.pWaitSemaphores = &acquire;
          submit.pWaitDstStageMask = &wait_stage;
-@@ -3670,7 +3790,8 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
+@@ -3670,7 +3795,8 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
      if (vkQueueSubmit(queue, 1u, &submit, fence) == VK_ERROR_DEVICE_LOST) device_lost("a frame's submit");
      perf::add_wait_time(perf::Clock::now() - submit_start, perf::Stall::Submit);
  
@@ -274,7 +279,7 @@ index ef4fcb8..64cadec 100644
          VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
          present.waitSemaphoreCount = 1u;
          present.pWaitSemaphores = &render_finished[image_index];
-@@ -7719,6 +7840,7 @@ double VulkanRenderer::Impl::wanted_rate() const {
+@@ -7719,6 +7845,7 @@ double VulkanRenderer::Impl::wanted_rate() const {
  }
  
  bool VulkanRenderer::Impl::interpolation_wanted() const {
