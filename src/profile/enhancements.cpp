@@ -388,8 +388,8 @@ void wrap_draw_sync(HleRegistrar &hle) {
 
 std::span<const GameOption> options() { return kOptions; }
 
-#if defined(PURE_QUEST_VR)
-// The Quest build's network defaults: the master server (a dedicated Linux machine running
+#if defined(PURE_QUEST_VR) || defined(PURE_ADHOC_PLAY)
+// The Quest build's (and an ad hoc desktop build's) network defaults: the master server (a dedicated Linux machine running
 // tools/quest/adhoc_server) and ad hoc play on, written to settings.ini the first time, so the game's ad hoc races
 // work without typing an address in the headset. PURE_VR_MASTER_SERVER names another host (host or host:port).
 constexpr const char *kMasterServer = "217.154.211.69";
@@ -406,7 +406,7 @@ void vr_network_defaults() {
 #endif
 
 void install(HleRegistrar &hle) {
-#if defined(PURE_QUEST_VR)
+#if defined(PURE_QUEST_VR) || defined(PURE_ADHOC_PLAY)
     vr_network_defaults();
 #endif
     wrap_draw_sync(hle);

@@ -53,6 +53,12 @@ set_property(SOURCE src/host/pure_main.cpp src/profile/enhancements.cpp APPEND P
     PURE_MODELS=${pure_models_value})
 message(STATUS "PURE_MODELS: ${PURE_MODELS} (the crowd and sky rows and the models backend as the default, D-027)")
 
+# Ad hoc play on a desktop build (the Network tab, the master server as the default address), as the Quest build has.
+option(PURE_ADHOC "Ad hoc play through the master server on a desktop build" OFF)
+if(PURE_ADHOC)
+    target_compile_definitions(PureNative PRIVATE PURE_ADHOC_PLAY=1)
+endif()
+
 # Zstandard's decoder for the ZIM images of HD texture packs (D-024, task 099): the framework compiles
 # host/gpu/texture_pack.cpp into PureNative itself, so linking the library here gives it zstd.h and the symbols.
 include(cmake/Zstd.cmake)

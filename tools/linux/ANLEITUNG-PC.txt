@@ -1,0 +1,36 @@
+Wipeout Pure - PC-Version fuer Linux (Ubuntu 24.04, NVIDIA)
+==========================================================
+
+NUR FUER DEINEN EIGENEN PC. Dieses Paket enthaelt den uebersetzten Spielcode
+und darf nicht weitergegeben oder hochgeladen werden.
+
+Voraussetzungen (einmalig, im Terminal):
+  sudo apt install libvulkan1 vulkan-tools
+  vulkaninfo --summary        (muss deine NVIDIA-Karte zeigen; sonst den
+                               NVIDIA-Treiber ueber "Zusaetzliche Treiber" installieren)
+
+1. Entpacken
+     tar xzf WipeoutPure-linux-x64.tar.gz
+     cd WipeoutPure-linux-x64
+
+2. Starten
+     ./wipeout-pure.sh
+   Beim ersten Start fragt das Programm nach deinem Disc-Image
+   (Wipeout Pure US Greatest Hits, UCUS-98612, .iso). Es prueft und kopiert es
+   nach ~/.local/share/pure-recomp/PureNative/
+
+3. HD-Texturen (optional, ca. 870 MB), nach dem ersten Start:
+     sudo apt install git
+     git clone https://github.com/0xf0xx0/WipEout-Pure-HD-Texture-Pack \
+         ~/.local/share/pure-recomp/PureNative/textures/UCUS98612
+   (in diesem Ordner muss danach die Datei textures.ini liegen), dann neu starten.
+
+4. Online spielen (Ad-hoc ueber deinen Server 217.154.211.69)
+   Der Server ist voreingestellt. Im Port-Menue (Esc, am Controller beide
+   Sticks gleichzeitig druecken) unter "Network" kannst du Adresse und
+   Spielernamen aendern.
+   Im Spiel: Hauptmenue > Multiplayer (Ad-hoc). Ein Spieler eroeffnet ein
+   Spiel ("Host"), der andere tritt ihm bei ("Join").
+
+Steuerung: Xbox-/PlayStation-Controller werden erkannt; Tastatur geht auch.
+Probleme: Das Log steht im Terminal, aus dem du gestartet hast - schick es mir.
