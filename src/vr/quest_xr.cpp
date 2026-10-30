@@ -633,12 +633,22 @@ void QuestXr::read_input() {
             const XrVector2f right = stick(right_stick_, right_x_, right_y_);
             axes[SDL_GAMEPAD_AXIS_LEFTX] = std::clamp(left.x, -1.0f, 1.0f);
             axes[SDL_GAMEPAD_AXIS_LEFTY] = std::clamp(-left.y, -1.0f, 1.0f);  // SDL: down is positive
-            // The menus move with the D-pad: the right stick, and outside a race the left one too (in a race the
-            // left stick steers, and the game would read the D-pad as digital steering on top of it).
+            // The menus move with the D-pad: the right stick, and the left one too outside a race, and in a race
+            // (the pause menu) its up and down while no thrust is held. Steering with thrust held never presses
+            // the D-pad, which the game would read as digital steering on top of the stick; left and right stay
+            // off in a race for the same reason. PURE_VR_PAUSE_STICK=0 leaves the left stick out of races.
+            static const bool pause_stick = [] {
+                const char *text = std::getenv("PURE_VR_PAUSE_STICK");
+                return text == nullptr || std::strcmp(text, "0") != 0;
+            }();
             XrVector2f menu = right;
-            if (!portablekit::gpu::xr::scene_3d()) {
+            const bool racing = portablekit::gpu::xr::scene_3d();
+            if (!racing) {
                 if (std::fabs(left.x) > std::fabs(menu.x)) menu.x = left.x;
                 if (std::fabs(left.y) > std::fabs(menu.y)) menu.y = left.y;
+            } else if (pause_stick && !thrust_.on && std::fabs(left.y) > std::fabs(menu.y) &&
+                       std::fabs(left.y) > 1.5f * std::fabs(left.x)) {
+                menu.y = left.y;
             }
             set(SDL_GAMEPAD_BUTTON_DPAD_UP, dpad_[0].update(menu.y, 0.6f, 0.4f));
             set(SDL_GAMEPAD_BUTTON_DPAD_DOWN, dpad_[1].update(-menu.y, 0.6f, 0.4f));
