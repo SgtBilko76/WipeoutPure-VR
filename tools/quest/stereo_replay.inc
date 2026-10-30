@@ -124,6 +124,173 @@ bool invert(const EyeMatrix &m, EyeMatrix &out) {
 
 } // namespace
 
+// MSAA for the eyes ----------------------------------------------------------
+//
+// PURE_VR_MSAA=4 (the default), 2 or 0 (off). The eyes draw into multisampled colour and depth (lazily allocated
+// where the GPU has such memory: on a tiler they stay in tile memory) and resolve into the eye image at the end of
+// the pass. The game's pipelines are single-sampled, so each one the eyes use gets a multisampled twin, made from
+// its key the first time (and kept in the pipeline cache for the next run).
+
+bool VulkanRenderer::Impl::create_eye_msaa() {
+    if (eye_msaa_pass != VK_NULL_HANDLE && eye_msaa[0].framebuffer != VK_NULL_HANDLE) return true;
+    static const VkSampleCountFlagBits wanted = [] {
+        const char *text = portablekit::env("VR_MSAA");
+        const int samples = text != nullptr ? std::atoi(text) : 4;
+        return samples >= 4 ? VK_SAMPLE_COUNT_4_BIT : samples >= 2 ? VK_SAMPLE_COUNT_2_BIT : VK_SAMPLE_COUNT_1_BIT;
+    }();
+    if (wanted == VK_SAMPLE_COUNT_1_BIT) return false;
+    if (eye_msaa_pass == VK_NULL_HANDLE) {
+        VkPhysicalDeviceProperties properties{};
+        vkGetPhysicalDeviceProperties(physical_device, &properties);
+        const VkSampleCountFlags counts =
+            properties.limits.framebufferColorSampleCounts & properties.limits.framebufferDepthSampleCounts;
+        eye_samples = (counts & wanted) != 0u ? wanted : (counts & VK_SAMPLE_COUNT_2_BIT) != 0u ? VK_SAMPLE_COUNT_2_BIT
+                                                                                              : VK_SAMPLE_COUNT_1_BIT;
+        if (eye_samples == VK_SAMPLE_COUNT_1_BIT) return false;
+        std::array<VkAttachmentDescription, 3> attachments{};
+        attachments[0].format = VK_FORMAT_R8G8B8A8_UNORM;
+        attachments[0].samples = eye_samples;
+        attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        attachments[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        attachments[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        attachments[1] = attachments[0];
+        attachments[1].format = depth_format;
+        attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        attachments[2] = attachments[0];
+        attachments[2].samples = VK_SAMPLE_COUNT_1_BIT;
+        attachments[2].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        // The game's shader declares the target's colour as an input attachment (16-bit targets blend on it); the
+        // eyes replay the shown 8888 frame, whose pipelines never read it, so the subpass leaves it unused.
+        const VkAttachmentReference color_reference{0u, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        const VkAttachmentReference depth_reference{1u, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+        const VkAttachmentReference resolve_reference{2u, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        const VkAttachmentReference input_reference{VK_ATTACHMENT_UNUSED, VK_IMAGE_LAYOUT_GENERAL};
+        VkSubpassDescription subpass{};
+        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        subpass.inputAttachmentCount = 1u;
+        subpass.pInputAttachments = &input_reference;
+        subpass.colorAttachmentCount = 1u;
+        subpass.pColorAttachments = &color_reference;
+        subpass.pResolveAttachments = &resolve_reference;
+        subpass.pDepthStencilAttachment = &depth_reference;
+        constexpr VkPipelineStageFlags kStages =
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+            VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+        constexpr VkAccessFlags kAccess = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                          VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
+                                          VK_ACCESS_TRANSFER_WRITE_BIT;
+        const std::array<VkSubpassDependency, 2> dependencies{
+            VkSubpassDependency{VK_SUBPASS_EXTERNAL, 0u, kStages, kStages, kAccess, kAccess, 0u},
+            VkSubpassDependency{0u, VK_SUBPASS_EXTERNAL, kStages, kStages, kAccess, kAccess, 0u},
+        };
+        VkRenderPassCreateInfo info{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+        info.attachmentCount = static_cast<std::uint32_t>(attachments.size());
+        info.pAttachments = attachments.data();
+        info.subpassCount = 1u;
+        info.pSubpasses = &subpass;
+        info.dependencyCount = static_cast<std::uint32_t>(dependencies.size());
+        info.pDependencies = dependencies.data();
+        if (vkCreateRenderPass(device, &info, nullptr, &eye_msaa_pass) != VK_SUCCESS) {
+            eye_msaa_pass = VK_NULL_HANDLE;
+            std::cout << "[vr] no MSAA: the render pass failed\n";
+            return false;
+        }
+    }
+    VkPhysicalDeviceMemoryProperties memory{};
+    vkGetPhysicalDeviceMemoryProperties(physical_device, &memory);
+    bool lazy_used = false;
+    const auto make = [&](VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect, VkImage &image,
+                          VkDeviceMemory &bound, VkImageView &view) {
+        VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        info.imageType = VK_IMAGE_TYPE_2D;
+        info.format = format;
+        info.extent = {eye_targets[0].extent.width, eye_targets[0].extent.height, 1u};
+        info.mipLevels = 1u;
+        info.arrayLayers = 1u;
+        info.samples = eye_samples;
+        info.tiling = VK_IMAGE_TILING_OPTIMAL;
+        info.usage = usage | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
+        info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (vkCreateImage(device, &info, nullptr, &image) != VK_SUCCESS) return false;
+        VkMemoryRequirements requirements{};
+        vkGetImageMemoryRequirements(device, image, &requirements);
+        std::uint32_t type = UINT32_MAX;
+        for (std::uint32_t i = 0; i < memory.memoryTypeCount && type == UINT32_MAX; ++i)
+            if ((requirements.memoryTypeBits & (1u << i)) != 0u &&
+                (memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT) != 0u)
+                type = i, lazy_used = true;
+        if (type == UINT32_MAX) type = find_memory_type(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocate.allocationSize = requirements.size;
+        allocate.memoryTypeIndex = type;
+        if (vkAllocateMemory(device, &allocate, nullptr, &bound) != VK_SUCCESS) return false;
+        vkBindImageMemory(device, image, bound, 0u);
+        VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        view_info.image = image;
+        view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        view_info.format = format;
+        view_info.subresourceRange = {aspect, 0u, 1u, 0u, 1u};
+        return vkCreateImageView(device, &view_info, nullptr, &view) == VK_SUCCESS;
+    };
+    for (std::uint32_t eye = 0; eye < 2u; ++eye) {
+        EyeMsaa &m = eye_msaa[eye];
+        if (!make(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_IMAGE_ASPECT_COLOR_BIT, m.color,
+                  m.color_memory, m.color_view) ||
+            !make(depth_format, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, depth_aspect(), m.depth, m.depth_memory,
+                  m.depth_view)) {
+            std::cout << "[vr] no MSAA: its images failed\n";
+            destroy_eye_msaa();
+            return false;
+        }
+        const std::array<VkImageView, 3> views{m.color_view, m.depth_view, eye_targets[eye].color_view};
+        VkFramebufferCreateInfo info{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        info.renderPass = eye_msaa_pass;
+        info.attachmentCount = static_cast<std::uint32_t>(views.size());
+        info.pAttachments = views.data();
+        info.width = eye_targets[eye].extent.width;
+        info.height = eye_targets[eye].extent.height;
+        info.layers = 1u;
+        if (vkCreateFramebuffer(device, &info, nullptr, &m.framebuffer) != VK_SUCCESS) {
+            std::cout << "[vr] no MSAA: its framebuffer failed\n";
+            destroy_eye_msaa();
+            return false;
+        }
+    }
+    std::cout << "[vr] eyes with " << static_cast<int>(eye_samples) << "x MSAA (" << (lazy_used ? "tile memory" : "device memory")
+              << ")\n";
+    return true;
+}
+
+void VulkanRenderer::Impl::destroy_eye_msaa() {
+    for (EyeMsaa &m : eye_msaa) {
+        if (m.framebuffer != VK_NULL_HANDLE) vkDestroyFramebuffer(device, m.framebuffer, nullptr);
+        if (m.color_view != VK_NULL_HANDLE) vkDestroyImageView(device, m.color_view, nullptr);
+        if (m.depth_view != VK_NULL_HANDLE) vkDestroyImageView(device, m.depth_view, nullptr);
+        if (m.color != VK_NULL_HANDLE) vkDestroyImage(device, m.color, nullptr);
+        if (m.depth != VK_NULL_HANDLE) vkDestroyImage(device, m.depth, nullptr);
+        if (m.color_memory != VK_NULL_HANDLE) vkFreeMemory(device, m.color_memory, nullptr);
+        if (m.depth_memory != VK_NULL_HANDLE) vkFreeMemory(device, m.depth_memory, nullptr);
+        m = EyeMsaa{};
+    }
+}
+
+VkPipeline VulkanRenderer::Impl::msaa_pipeline(VkPipeline pipeline) {
+    if (const auto found = msaa_pipelines.find(pipeline); found != msaa_pipelines.end()) return found->second;
+    VkPipeline made = VK_NULL_HANDLE;
+    for (const auto &[key, single] : pipelines) {
+        if (single != pipeline) continue;
+        msaa_build = true;
+        made = create_pipeline(key);
+        msaa_build = false;
+        break;
+    }
+    msaa_pipelines.emplace(pipeline, made);
+    return made;
+}
+
 bool VulkanRenderer::Impl::stereo_wanted() const {
     if (!xr) return false;
     static const bool flat = portablekit::env("VR_FLAT") != nullptr;
@@ -163,6 +330,7 @@ bool VulkanRenderer::Impl::begin_stereo() {
     }();
     for (Target &target : eye_targets) {
         if (target.color != VK_NULL_HANDLE) continue;
+        destroy_eye_msaa();  // its framebuffers name the eye images
         target = Target{};
         target.extent = extent;
         std::string error;
@@ -176,6 +344,7 @@ bool VulkanRenderer::Impl::begin_stereo() {
         }
     }
     if (!xr::bridge()->stereo_begin(stereo_frame)) return false;
+    create_eye_msaa();
     stereo_begun = true;
     return true;
 }
@@ -261,9 +430,10 @@ void VulkanRenderer::Impl::replay_eye(VkCommandBuffer commands, Target &target, 
     const xr::EyeView &view = stereo.eyes[eye];
     breadcrumb(commands, "an eye of the stereo view, " + std::to_string(frame.groups.size()) + " draw calls");
     initialize_layouts(commands, target);
+    const bool msaa = eye_msaa[eye].framebuffer != VK_NULL_HANDLE;
     VkRenderPassBeginInfo pass{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-    pass.renderPass = render_pass;
-    pass.framebuffer = target.framebuffer;
+    pass.renderPass = msaa ? eye_msaa_pass : render_pass;
+    pass.framebuffer = msaa ? eye_msaa[eye].framebuffer : target.framebuffer;
     pass.renderArea = {{0, 0}, target.extent};
     vkCmdBeginRenderPass(commands, &pass, VK_SUBPASS_CONTENTS_INLINE);
     perf::count_render_pass();
@@ -332,6 +502,7 @@ void VulkanRenderer::Impl::replay_eye(VkCommandBuffer commands, Target &target, 
 
     DrawState set{};
     bool known = false;
+    VkPipeline bound_single = VK_NULL_HANDLE;  // under MSAA: the single-sampled pipeline whose twin is bound
     EyeMatrix last_view{}, last_world{}, last_clip{}, eye_space{}, transform{};
     bool cached = false;
     std::uint32_t perspective = 0u, flat = 0u, sprites = 0u;
@@ -597,7 +768,7 @@ void VulkanRenderer::Impl::replay_eye(VkCommandBuffer commands, Target &target, 
         if (!known || state.blend != set.blend) vkCmdSetBlendConstants(commands, state.blend.data());
         if (!known || std::memcmp(&state.scissor, &set.scissor, sizeof(VkRect2D)) != 0)
             vkCmdSetScissor(commands, 0u, 1u, &state.scissor);
-        if (!known || state.pipeline != set.pipeline)
+        if (!msaa && (!known || state.pipeline != set.pipeline))
             vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, state.pipeline);
         if (!known || state.texture != set.texture)
             vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0u, 1u,
@@ -611,6 +782,14 @@ void VulkanRenderer::Impl::replay_eye(VkCommandBuffer commands, Target &target, 
                                0u, sizeof(PushConstants), &state.push);
         set = state;
         known = true;
+        if (msaa && state.pipeline != bound_single) {
+            bound_single = state.pipeline;
+            const VkPipeline twin = msaa_pipeline(state.pipeline);
+            if (twin == VK_NULL_HANDLE) continue;
+            vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, twin);
+        } else if (msaa && msaa_pipeline(state.pipeline) == VK_NULL_HANDLE) {
+            continue;
+        }
         const VkDeviceSize vertex_base = drawn.vertex_base;
         vkCmdBindVertexBuffers(commands, 0u, 1u, &vertex_buffer, &vertex_base);
         if (drawn.index_buffer != VK_NULL_HANDLE) {

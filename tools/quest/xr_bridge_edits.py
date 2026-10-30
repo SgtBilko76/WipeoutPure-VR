@@ -406,6 +406,22 @@ edit(R, "    void replay(VkCommandBuffer commands, std::uint32_t slot, float t);
      "    std::array<bool, 2> eye_timed{};  // by present slot\n"
      "    xr::StereoFrame stereo_frame{};\n"
      "    double frame_end_ms{}, eye_submit_ms{};  // CPU time, summed until logged\n"
+     "    // MSAA for the eyes (stereo_replay.inc): a pass with multisampled colour and depth resolving into the eye\n"
+     "    // image, and a multisampled copy of each pipeline the eyes draw with (create_pipeline under msaa_build).\n"
+     "    struct EyeMsaa {\n"
+     "        VkImage color{}, depth{};\n"
+     "        VkDeviceMemory color_memory{}, depth_memory{};\n"
+     "        VkImageView color_view{}, depth_view{};\n"
+     "        VkFramebuffer framebuffer{};\n"
+     "    };\n"
+     "    std::array<EyeMsaa, 2> eye_msaa{};\n"
+     "    VkRenderPass eye_msaa_pass{};\n"
+     "    VkSampleCountFlagBits eye_samples{VK_SAMPLE_COUNT_1_BIT};\n"
+     "    mutable bool msaa_build{};\n"
+     "    std::map<VkPipeline, VkPipeline> msaa_pipelines;\n"
+     "    bool create_eye_msaa();\n"
+     "    void destroy_eye_msaa();\n"
+     "    VkPipeline msaa_pipeline(VkPipeline pipeline);\n"
      "    bool stereo_begun{};  // the frame being submitted has its eyes drawn after it (submit_stereo)\n"
      "    double eye_gpu_ms{};\n"
      "    std::uint32_t eye_gpu_samples{};\n"
@@ -437,6 +453,7 @@ edit(R, "    for (Target &target : blend_targets) destroy_target(target);\n"
         "    older_picture_valid = newer_picture_valid = false;\n",
      "    for (Target &target : blend_targets) destroy_target(target);\n"
      "    for (Target &target : eye_targets) destroy_target(target);\n"
+     "    destroy_eye_msaa();\n"
      "    older_picture_valid = newer_picture_valid = false;\n")
 
 V = "host/gpu/shaders/ge.vert"
@@ -517,5 +534,19 @@ edit(R, "        info.format = format;\n        info.extent = {width, height, 1u
 # The Quest APK carries DejaVu Sans for the port's menu (packaging/quest/fonts).
 edit(A, "constexpr const char *kBundledFonts[] = {\"NotoSansCJKjp-Regular.otf\"};\n",
      "constexpr const char *kBundledFonts[] = {\"DejaVuSans.ttf\", \"NotoSansCJKjp-Regular.otf\"};\n")
+
+# A multisampled pipeline for the eyes' MSAA pass (msaa_pipeline).
+edit(R, "    info.layout = pipeline_layout;\n    info.renderPass = render_pass;\n    VkPipeline pipeline{};\n"
+        "    if (vkCreateGraphicsPipelines(device, pipeline_cache, 1u, &info, nullptr, &pipeline) != VK_SUCCESS)\n"
+        "        return VK_NULL_HANDLE;\n    return pipeline;\n}\n\nbool VulkanRenderer::pump_events() {\n",
+     "    info.layout = pipeline_layout;\n    info.renderPass = render_pass;\n"
+     "    if (msaa_build) {\n"
+     "        // The eyes' MSAA pass (xr_bridge.hpp, stereo_replay.inc).\n"
+     "        multisample.rasterizationSamples = eye_samples;\n"
+     "        info.renderPass = eye_msaa_pass;\n"
+     "    }\n"
+     "    VkPipeline pipeline{};\n"
+     "    if (vkCreateGraphicsPipelines(device, pipeline_cache, 1u, &info, nullptr, &pipeline) != VK_SUCCESS)\n"
+     "        return VK_NULL_HANDLE;\n    return pipeline;\n}\n\nbool VulkanRenderer::pump_events() {\n")
 
 print("changed:", sorted(set(changed)) or "nothing (already applied)")
