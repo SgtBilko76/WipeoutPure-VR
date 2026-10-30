@@ -350,6 +350,18 @@ VkPhysicalDevice QuestXr::physical_device(VkInstance instance) {
     VkPhysicalDevice device = VK_NULL_HANDLE;
     if (!ok(get_graphics_device_(instance_, system_, instance, &device), "xrGetVulkanGraphicsDeviceKHR"))
         return VK_NULL_HANDLE;
+    // Quest 3/3S and PICO 4 Ultra (XR2 Gen 2, Adreno 740) run the defaults: eyes at 0.9, 2x MSAA, 60-fps races at
+    // full speed. Quest 2/Pro and PICO 4 (XR2 Gen 1, Adreno 650) have about half the GPU: smaller eyes and no MSAA
+    // unless env.txt names them. Untested on those headsets.
+    VkPhysicalDeviceProperties properties{};
+    vkGetPhysicalDeviceProperties(device, &properties);
+    const char *adreno = std::strstr(properties.deviceName, "Adreno (TM) ");
+    const int model = adreno != nullptr ? std::atoi(adreno + 12) : 0;
+    if (model > 0 && model < 700) {
+        setenv("PURE_VR_EYE_SCALE", "0.7", 0);
+        setenv("PURE_VR_MSAA", "0", 0);
+    }
+    log("GPU %s: %s defaults", properties.deviceName, model > 0 && model < 700 ? "XR2 Gen 1 (lighter)" : "full");
     return device;
 }
 

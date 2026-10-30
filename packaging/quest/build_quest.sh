@@ -10,7 +10,9 @@
 # Environment: ANDROID_HOME (the SDK, default ~/Android/Sdk or ~/workspace/android-sdk), ANDROID_NDK (default the
 # newest NDK in the SDK), PURE_QUEST_DEPS (where SDL3 and the OpenXR loader are fetched and built, default
 # build/quest-deps), JOBS (parallel compile jobs, default 4; each generated unit needs ~1 GB), VERSION_NAME,
-# KEYSTORE/KEYSTORE_PASS/KEY_ALIAS (default the SDK's debug key, so builds install over each other).
+# KEYSTORE/KEYSTORE_PASS/KEY_ALIAS (default the SDK's debug key, so builds install over each other), RELEASE=1 (a
+# release: not debuggable, VERSION_NAME required), QUEST_ADHOC=1 (ad hoc play through the master server, off by
+# default until it has been tested).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -75,7 +77,8 @@ cmake -S "$ROOT" -B "$B" -G Ninja -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/andro
     -DPORTABLEKIT_ANDROID_APP=ON -DPORTABLEKIT_RELEASE=ON -DSDL3_DIR="$SDL_INSTALL/lib/cmake/SDL3" \
     -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH -DPython3_EXECUTABLE="$(command -v python3)" \
     -DPSPRECOMP_GENERATED_JOBS="${JOBS:-4}" -DPORTABLEKIT_BUILD_LABEL=Quest \
-    -DPURE_QUEST_VR=ON -DPURE_OPENXR_DIR="$OPENXR_DIR" > "$OUT/configure.log"
+    -DPURE_QUEST_VR=ON -DPURE_OPENXR_DIR="$OPENXR_DIR" -DPURE_ADHOC="$([[ -n "${QUEST_ADHOC:-}" ]] && echo ON || echo OFF)" \
+    > "$OUT/configure.log"
 cmake --build "$B" --target PureNative -j"${JOBS:-4}"
 
 # The APK, packed without Gradle as PortableKit's packaging/android/build_apk.sh does, with this manifest and the
@@ -86,7 +89,7 @@ rm -rf "$work"
 mkdir -p "$work/classes" "$work/dex" "$work/lib/arm64-v8a" "$work/assets/licenses"
 echo "compiling SDL's Java activity and PortableKit's"
 javac -nowarn --release 11 -classpath "$ANDROID_JAR" -d "$work/classes" \
-    $(find "$SDL_SRC/android-project/app/src/main/java" "$PK/java" -name '*.java') 2> "$work/javac.log"
+    $(find "$SDL_SRC/android-project/app/src/main/java" "$PK/java" "$HERE/java" -name '*.java') 2> "$work/javac.log"
 "$BUILD_TOOLS/d8" --release --min-api $MIN_SDK --lib "$ANDROID_JAR" --output "$work/dex" \
     $(find "$work/classes" -name '*.class')
 
@@ -98,13 +101,24 @@ cp "$B"/bin/lib/FFmpeg-COPYING.LGPLv2.1.txt "$B"/bin/lib/FFmpeg-SOURCE.txt "$wor
 mkdir -p "$work/assets/fonts"
 cp "$HERE/fonts/DejaVuSans.ttf" "$work/assets/fonts/"
 cp "$HERE/fonts/DejaVu-LICENSE.txt" "$work/assets/licenses/"
+# The shader pipelines seen on a headset (android_import.inc copies them to the data folder on the first start).
+if compgen -G "$HERE/pipeline/*.bin" > /dev/null; then
+    mkdir -p "$work/assets/pipeline"
+    cp "$HERE"/pipeline/*.bin "$work/assets/pipeline/"
+fi
 "$BUILD_TOOLS/aapt2" compile --dir "$PK/res" -o "$work/res.zip"
 "$BUILD_TOOLS/aapt2" compile --dir "$HERE/res" -o "$work/game-res.zip"
+if [[ -n "${RELEASE:-}" ]]; then
+    [[ -n "${VERSION_NAME:-}" ]] || { echo "a release needs VERSION_NAME" >&2; exit 1; }
+    debug_flag=()
+else
+    debug_flag=(--debug-mode)
+fi
 version_name="${VERSION_NAME:-0.1.0-alpha}"
 version_code="${VERSION_CODE:-$(git -C "$ROOT" rev-list --count HEAD)}"
 "$BUILD_TOOLS/aapt2" link -I "$ANDROID_JAR" --manifest "$HERE/AndroidManifest.xml" \
     --min-sdk-version $MIN_SDK --target-sdk-version 32 --version-name "$version_name" --version-code "$version_code" \
-    --debug-mode -A "$work/assets" -o "$work/unsigned.apk" --rename-manifest-package "$APP_ID" \
+    "${debug_flag[@]}" -A "$work/assets" -o "$work/unsigned.apk" --rename-manifest-package "$APP_ID" \
     "$work/res.zip" -R "$work/game-res.zip" --auto-add-overlay
 
 echo "adding native libraries"
@@ -151,7 +165,7 @@ if [[ ! -f "$keystore" ]]; then
     keytool -genkeypair -keystore "$keystore" -storepass android -keypass android -alias androiddebugkey \
         -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US" > /dev/null 2>&1
 fi
-apk="$OUT/WipeoutPureVR-$version_name.apk"
+apk="$OUT/WipeoutPure-VR-$version_name.apk"
 "$BUILD_TOOLS/zipalign" -f -P 16 4 "$work/unsigned.apk" "$work/aligned.apk"
 "$BUILD_TOOLS/apksigner" sign --ks "$keystore" --ks-pass "pass:$password" --key-pass "pass:$password" \
     --ks-key-alias "$alias" --out "$apk" "$work/aligned.apk"

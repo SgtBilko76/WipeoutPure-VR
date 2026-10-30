@@ -9,7 +9,12 @@
 #include "ui/layer.hpp"
 #endif
 #if defined(PURE_QUEST_VR)
+#include "gpu/texture_pack_host.hpp"
 #include "gpu/xr_bridge.hpp"
+#include "hle/hle_common.hpp"
+
+#include <chrono>
+#include <filesystem>
 
 #include <sys/stat.h>
 
@@ -275,6 +280,30 @@ void dump_on_view_press(const psprecomp::GuestMemory &m) {
 }
 #endif
 
+#if defined(PURE_QUEST_VR)
+// The HD texture pack the app downloads on its first start (packaging/quest/java/.../HdTextures.java) arrives while
+// the game runs: once its folder holds textures.ini, the renderer opens it from the next frame. Checked every two
+// seconds while no pack is installed; done once a pack is there or the player has turned packs off.
+void vr_hd_textures_poll() {
+    static bool done = false;
+    static auto next = std::chrono::steady_clock::now();
+    if (done || std::chrono::steady_clock::now() < next) return;
+    next = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    gpu::TexturePackHost *host = portablekit::active_texture_pack_host();
+    if (host == nullptr) return;
+    if (host->texture_pack_status() != "Not installed") {
+        done = true;
+        return;
+    }
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(std::filesystem::path(host->texture_pack_folder()) / "textures.ini", ec))
+        return;
+    host->reload_texture_pack();
+    std::cout << "[pure] VR: the downloaded HD textures are there; loading them\n";
+    done = true;
+}
+#endif
+
 // E6: the flash countdown cleared in a free-running frame.
 void smooth_flashes(psprecomp::GuestMemory &m) {
     const std::uint32_t frame = m.load32(kFrameObjectPtr);
@@ -372,6 +401,7 @@ void wrap_draw_sync(HleRegistrar &hle) {
         // The headset shows a race in stereo, the frontend on its screen (xr_bridge.hpp).
         portablekit::gpu::xr::set_scene_3d(race_backend(m));
         dump_on_view_press(m);
+        vr_hd_textures_poll();
 #endif
         shield_step::frame(rt);  // task 107: the shield effect's override, once the race runs faster than the PSP
 #if defined(PURE_QUEST_VR)
@@ -388,8 +418,8 @@ void wrap_draw_sync(HleRegistrar &hle) {
 
 std::span<const GameOption> options() { return kOptions; }
 
-#if defined(PURE_QUEST_VR) || defined(PURE_ADHOC_PLAY)
-// The Quest build's (and an ad hoc desktop build's) network defaults: the master server (a dedicated Linux machine running
+#if defined(PURE_ADHOC_PLAY)
+// The ad hoc build's (Quest or desktop, -DPURE_ADHOC=ON) network defaults: the master server (a dedicated Linux machine running
 // tools/quest/adhoc_server) and ad hoc play on, written to settings.ini the first time, so the game's ad hoc races
 // work without typing an address in the headset. PURE_VR_MASTER_SERVER names another host (host or host:port).
 constexpr const char *kMasterServer = "217.154.211.69";
@@ -406,7 +436,7 @@ void vr_network_defaults() {
 #endif
 
 void install(HleRegistrar &hle) {
-#if defined(PURE_QUEST_VR) || defined(PURE_ADHOC_PLAY)
+#if defined(PURE_ADHOC_PLAY)
     vr_network_defaults();
 #endif
     wrap_draw_sync(hle);

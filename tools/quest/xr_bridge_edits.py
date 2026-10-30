@@ -287,7 +287,19 @@ edit(L, "    ImGui_ImplSDL3_NewFrame();\n    ImGuiIO &io = ImGui::GetIO();\n",
 # made over adb or USB in Android/data are not the app's own).
 A = "host/platform/android_app.cpp"
 edit(A, "#include <pthread.h>\n",
-     "#include <pthread.h>\n#include <cstdlib>\n#include <cstring>\n#include <vector>\n")
+     "#include <pthread.h>\n#include <algorithm>\n#include <cctype>\n#include <cstdlib>\n#include <cstring>\n"
+     "#include <vector>\n\n#include \"install/installer.hpp\"\n")
+# The log beside the game data, where adb and a file manager reach it (a release build is not debuggable).
+edit(A, "    const char *storage = SDL_GetAndroidInternalStoragePath();\n    if (storage == nullptr) return;\n"
+        "    const std::string log =",
+     "#if defined(PORTABLEKIT_ANDROID_EXTERNAL_DATA)\n"
+     "    const char *storage = SDL_GetAndroidExternalStoragePath();\n"
+     "#else\n"
+     "    const char *storage = SDL_GetAndroidInternalStoragePath();\n"
+     "#endif\n"
+     "    if (storage == nullptr) return;\n"
+     "    const std::string log =")
+import_code = pathlib.Path(__file__).with_name("android_import.inc").read_text()
 edit(A, "} // namespace\n\nint main(int argc, char *argv[]) {\n    redirect_output();\n",
      "#if defined(PORTABLEKIT_ANDROID_EXTERNAL_DATA)\n"
      "// Unpacks a ustar archive (regular files and directories) into `into`.\n"
@@ -333,6 +345,7 @@ edit(A, "} // namespace\n\nint main(int argc, char *argv[]) {\n    redirect_outp
      "    return true;\n"
      "}\n"
      "\n"
+     + import_code +
      "void use_external_storage() {\n"
      "    const char *external = SDL_GetAndroidExternalStoragePath();\n"
      "    if (external == nullptr) return;\n"
@@ -366,6 +379,8 @@ edit(A, "} // namespace\n\nint main(int argc, char *argv[]) {\n    redirect_outp
      "            std::printf(\"[android] env.txt: %s\\n\", line.c_str());\n"
      "        }\n"
      "    }\n"
+     "    copy_bundled_pipelines(root);\n"
+     "    import_disc_image(root);\n"
      "    setenv(portablekit::env_name(\"DATA_DIR\").c_str(), root.c_str(), 0);\n"
      "    const std::filesystem::path game = root / \"game\";\n"
      "    if (std::filesystem::is_regular_file(game / \"disc.iso\", ec) &&\n"

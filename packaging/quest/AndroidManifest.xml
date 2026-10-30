@@ -4,25 +4,24 @@
      packaging/quest/build_quest.sh renames the package to the app id and adds
      the version. Differences from the framework's packaging/android manifest:
      the VR categories and meta-data, the OpenXR runtime broker queries and
-     permissions, a fixed landscape activity, and no network permissions (the
-     game's online services are gone). -->
+     permissions, a fixed landscape activity, and Internet access only for the
+     HD texture download on the first start (HdTextures.java). -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="io.github.teamgdb.portablekit"
     android:installLocation="auto">
 
     <uses-feature android:name="android.hardware.vulkan.version" android:version="0x401000" android:required="true" />
-    <uses-feature android:name="android.hardware.vr.headtracking" android:version="1" android:required="true" />
+    <!-- Not required: PICO's store and installer treat a required head-tracking feature as unknown. -->
+    <uses-feature android:name="android.hardware.vr.headtracking" android:version="1" android:required="false" />
     <uses-feature android:name="android.hardware.gamepad" android:required="false" />
     <!-- Hand tracking is not used; declaring it optional keeps Horizon OS from
          holding the launch behind its "controllers required" dialog. -->
     <uses-feature android:name="oculus.software.handtracking" android:required="false" />
     <uses-permission android:name="com.oculus.permission.HAND_TRACKING" />
     <uses-permission android:name="org.khronos.openxr.permission.OPENXR" />
-    <!-- Ad hoc races through the master server (TCP 27312 and 27313) -->
+    <!-- The HD texture download on the first start (and ad hoc races in a -DPURE_ADHOC=ON build) -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
-    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="org.khronos.openxr.permission.OPENXR_SYSTEM" />
 
     <queries>
@@ -46,7 +45,7 @@
         <meta-data android:name="com.oculus.intent.category.VR" android:value="vr_only" />
         <meta-data android:name="pvr.app.type" android:value="vr" />
 
-        <activity android:name="io.github.teamgdb.portablekit.GameActivity"
+        <activity android:name="online.portroyale.wipeoutpurevr.WipeoutActivity"
             android:label="@string/app_name"
             android:alwaysRetainTaskState="true"
             android:launchMode="singleTask"
