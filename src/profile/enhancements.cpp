@@ -218,6 +218,16 @@ bool vr_thirty_fps() {
     return thirty;
 }
 
+// PURE_VR_RACE_FPS=72 (or display): races at the headset's refresh (E8's display rate: 71.64 Hz at 72), the game
+// stepping one frame per headset frame. It needs about 13.9 ms a frame where 60 fps allows 16.7.
+bool vr_display_fps() {
+    static const bool display = [] {
+        const char *v = env("VR_RACE_FPS");
+        return v != nullptr && (std::strcmp(v, "72") == 0 || std::strcmp(v, "display") == 0);
+    }();
+    return display;
+}
+
 void thirty_fps(psprecomp::GuestMemory &m) {
     if (!race_backend(m)) return;
     const std::uint32_t frame = m.load32(kFrameObjectPtr);
@@ -315,9 +325,9 @@ void display_rate(const psprecomp::GuestMemory *m) {
     double hz = 0.0;
     if (settings::game_option("display_rate") == 1u) hz = display_hz();
 #if defined(PURE_QUEST_VR)
-    // The headset keeps the PSP's vblank: races at its 30 fps (vr_thirty_fps) or 59.94 (PURE_VR_RACE_FPS=60); the
-    // headset turns the picture with the head at its own refresh between the game's frames.
-    hz = 0.0;
+    // The headset keeps the PSP's vblank (races at 59.94, or 30 with PURE_VR_RACE_FPS=30) unless the races follow
+    // its refresh (vr_display_fps); it turns the picture with the head at its own refresh between the game's frames.
+    if (!vr_display_fps()) hz = 0.0;
 #endif
     std::uint64_t period = kVBlankPeriodUs;
     std::uint64_t display_period = 0u;

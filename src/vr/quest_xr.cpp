@@ -193,6 +193,8 @@ private:
     PFN_xrGetVulkanGraphicsDeviceKHR get_graphics_device_{};
     PFN_xrGetVulkanGraphicsRequirementsKHR get_graphics_requirements_{};
     PFN_xrGetDisplayRefreshRateFB get_refresh_rate_{};
+    PFN_xrEnumerateDisplayRefreshRatesFB enumerate_refresh_rates_{};
+    PFN_xrRequestDisplayRefreshRateFB request_refresh_rate_{};
 
     // Vulkan: the runtime's queue and the semaphores ordering the copies.
     VkDevice device_{VK_NULL_HANDLE};
@@ -318,7 +320,10 @@ bool QuestXr::prepare() {
         !get("xrGetVulkanGraphicsDeviceKHR", get_graphics_device_) ||
         !get("xrGetVulkanGraphicsRequirementsKHR", get_graphics_requirements_))
         return false;
-    if (refresh_ext_ && !get("xrGetDisplayRefreshRateFB", get_refresh_rate_)) refresh_ext_ = false;
+    if (refresh_ext_ && (!get("xrGetDisplayRefreshRateFB", get_refresh_rate_) ||
+                         !get("xrEnumerateDisplayRefreshRatesFB", enumerate_refresh_rates_) ||
+                         !get("xrRequestDisplayRefreshRateFB", request_refresh_rate_)))
+        refresh_ext_ = false;
     if (perf_ext_ && !get("xrPerfSettingsSetPerformanceLevelEXT", set_performance_level_)) perf_ext_ = false;
     XrInstanceProperties instance_properties{XR_TYPE_INSTANCE_PROPERTIES};
     xrGetInstanceProperties(instance_, &instance_properties);
@@ -423,6 +428,23 @@ bool QuestXr::start(VkInstance instance, VkPhysicalDevice physical_device, VkDev
     log("screen swapchain %ux%u, format %lld, %u images", kPanelWidth, kPanelHeight,
         static_cast<long long>(swapchain_format_), count);
     if (refresh_ext_) {
+        // The rates the headset offers, and the one PURE_VR_REFRESH asks for (72 by default, the system's): 120 shows
+        // each frame of a 60-fps race twice, evenly, where 72 repeats every fifth.
+        std::uint32_t count = 0;
+        enumerate_refresh_rates_(session_, 0, &count, nullptr);
+        std::vector<float> rates(count);
+        enumerate_refresh_rates_(session_, count, &count, rates.data());
+        std::string offered;
+        for (float r : rates) offered += " " + std::to_string(static_cast<int>(std::lround(r)));
+        log("display refresh rates offered:%s", offered.c_str());
+        if (const char *text = std::getenv("PURE_VR_REFRESH"); text != nullptr) {
+            const float wanted = std::strtof(text, nullptr);
+            float best = 0.0f;
+            for (float r : rates)
+                if (std::fabs(r - wanted) < 0.5f) best = r;
+            if (best > 0.0f) ok(request_refresh_rate_(session_, best), "xrRequestDisplayRefreshRateFB");
+            else log("PURE_VR_REFRESH=%s is not offered", text);
+        }
         float rate = 0.0f;
         if (XR_SUCCEEDED(get_refresh_rate_(session_, &rate)) && rate > 0.0f) refresh_.store(rate);
     }
