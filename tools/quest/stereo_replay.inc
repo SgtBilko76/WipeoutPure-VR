@@ -126,7 +126,7 @@ bool invert(const EyeMatrix &m, EyeMatrix &out) {
 
 // MSAA for the eyes ----------------------------------------------------------
 //
-// PURE_VR_MSAA=4 (the default), 2 or 0 (off). The eyes draw into multisampled colour and depth (lazily allocated
+// PURE_VR_MSAA=2 (the default), 4 or 0 (off). The eyes draw into multisampled colour and depth (lazily allocated
 // where the GPU has such memory: on a tiler they stay in tile memory) and resolve into the eye image at the end of
 // the pass. The game's pipelines are single-sampled, so each one the eyes use gets a multisampled twin, made from
 // its key the first time (and kept in the pipeline cache for the next run).
@@ -135,7 +135,7 @@ bool VulkanRenderer::Impl::create_eye_msaa() {
     if (eye_msaa_pass != VK_NULL_HANDLE && eye_msaa[0].framebuffer != VK_NULL_HANDLE) return true;
     static const VkSampleCountFlagBits wanted = [] {
         const char *text = portablekit::env("VR_MSAA");
-        const int samples = text != nullptr ? std::atoi(text) : 4;
+        const int samples = text != nullptr ? std::atoi(text) : 2;  // 4x cost 3 ms of GPU: stutter at 60 fps
         return samples >= 4 ? VK_SAMPLE_COUNT_4_BIT : samples >= 2 ? VK_SAMPLE_COUNT_2_BIT : VK_SAMPLE_COUNT_1_BIT;
     }();
     if (wanted == VK_SAMPLE_COUNT_1_BIT) return false;
