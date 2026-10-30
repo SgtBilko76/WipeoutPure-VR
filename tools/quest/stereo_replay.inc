@@ -128,8 +128,9 @@ bool invert(const EyeMatrix &m, EyeMatrix &out) {
 //
 // PURE_VR_MSAA=2 (the default), 4 or 0 (off). The eyes draw into multisampled colour and depth (lazily allocated
 // where the GPU has such memory: on a tiler they stay in tile memory) and resolve into the eye image at the end of
-// the pass. The game's pipelines are single-sampled, so each one the eyes use gets a multisampled twin, made from
-// its key the first time (and kept in the pipeline cache for the next run).
+// the pass. The game's pipelines are single-sampled, so each one the eyes use gets a multisampled twin: made in the
+// background for every key known when the pass is first built (prewarm_msaa), else from its key the first time it
+// is drawn; the pipeline cache keeps them for the next run.
 
 bool VulkanRenderer::Impl::create_eye_msaa() {
     if (eye_msaa_pass != VK_NULL_HANDLE && eye_msaa[0].framebuffer != VK_NULL_HANDLE) return true;
@@ -261,7 +262,42 @@ bool VulkanRenderer::Impl::create_eye_msaa() {
     }
     std::cout << "[vr] eyes with " << static_cast<int>(eye_samples) << "x MSAA (" << (lazy_used ? "tile memory" : "device memory")
               << ")\n";
+    prewarm_msaa();
     return true;
+}
+
+// The twins of the pipelines made this run (first: the race's), then of those the start-up prewarm made from the
+// last runs' list, on a thread of their own; msaa_pipeline takes them from there. PURE_NO_PIPELINE_PREWARM turns it
+// off with the other prewarm.
+void VulkanRenderer::Impl::prewarm_msaa() {
+    if (msaa_prewarm->thread.joinable() || portablekit::env("NO_PIPELINE_PREWARM") != nullptr) return;
+    std::vector<PipelineKey> keys;
+    for (const auto &[key, pipeline] : pipelines) keys.push_back(key);
+    {
+        std::lock_guard<std::mutex> guard(prewarm->lock);
+        for (const auto &[key, pipeline] : prewarm->made) keys.push_back(key);
+    }
+    msaa_prewarm->thread = std::thread([this, keys = std::move(keys)] {
+        const auto start = std::chrono::steady_clock::now();
+        std::uint32_t made = 0u;
+        for (const PipelineKey &key : keys) {
+            if (msaa_prewarm->stop.load(std::memory_order_relaxed)) break;
+            {
+                std::lock_guard<std::mutex> guard(msaa_prewarm->lock);
+                if (msaa_prewarm->made.contains(key)) continue;
+            }
+            const VkPipeline pipeline = create_pipeline(key, true);
+            if (pipeline == VK_NULL_HANDLE) continue;
+            std::lock_guard<std::mutex> guard(msaa_prewarm->lock);
+            if (!msaa_prewarm->made.emplace(key, pipeline).second) vkDestroyPipeline(device, pipeline, nullptr);
+            ++made;
+        }
+        std::printf("[vr] %u MSAA pipelines made in the background in %.1f ms\n", made,
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+        std::fflush(stdout);
+        std::lock_guard<std::mutex> guard(msaa_prewarm->lock);
+        msaa_prewarm_done = true;
+    });
 }
 
 void VulkanRenderer::Impl::destroy_eye_msaa() {
@@ -282,10 +318,37 @@ VkPipeline VulkanRenderer::Impl::msaa_pipeline(VkPipeline pipeline) {
     VkPipeline made = VK_NULL_HANDLE;
     for (const auto &[key, single] : pipelines) {
         if (single != pipeline) continue;
-        msaa_build = true;
-        made = create_pipeline(key);
-        msaa_build = false;
+        {
+            std::lock_guard<std::mutex> guard(msaa_prewarm->lock);
+            if (const auto ready = msaa_prewarm->made.find(key); ready != msaa_prewarm->made.end()) {
+                made = ready->second;
+                msaa_prewarm->made.erase(ready);
+                ++msaa_from_prewarm;
+            }
+        }
+        if (made == VK_NULL_HANDLE) {
+            // Not made in the background (yet): made here, which the frame waits for, and counted.
+            const auto start = std::chrono::steady_clock::now();
+            made = create_pipeline(key, true);
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            ++msaa_new;
+            msaa_new_ms += ms;
+            msaa_new_max_ms = std::max(msaa_new_max_ms, ms);
+            pipeline_cache_dirty = true;
+            pipeline_cache_changed = std::chrono::steady_clock::now();
+        }
         break;
+    }
+    // The background's twins go into the pipeline cache file with the next save.
+    bool background_done = false;
+    if (!msaa_prewarm_saved) {
+        std::lock_guard<std::mutex> guard(msaa_prewarm->lock);
+        background_done = msaa_prewarm_done;
+    }
+    if (background_done) {
+        msaa_prewarm_saved = true;
+        pipeline_cache_dirty = true;
+        pipeline_cache_changed = std::chrono::steady_clock::now();
     }
     msaa_pipelines.emplace(pipeline, made);
     return made;
@@ -767,6 +830,12 @@ void VulkanRenderer::Impl::replay_eye(VkCommandBuffer commands, Target &target, 
                         frame_end_ms / static_cast<double>(eye_gpu_samples),
                         eye_submit_ms / static_cast<double>(eye_gpu_samples), target_extent.width,
                         target_extent.height);
+        if (msaa_new != 0u || msaa_from_prewarm != 0u) {
+            std::printf("[vr] MSAA pipelines: %u from the background, %u made in the frame (%.1f ms, the longest %.1f)\n",
+                        msaa_from_prewarm, msaa_new, msaa_new_ms, msaa_new_max_ms);
+            msaa_from_prewarm = msaa_new = 0u;
+            msaa_new_ms = msaa_new_max_ms = 0.0;
+        }
         frame_end_ms = eye_submit_ms = 0.0;
         eye_gpu_ms = 0.0;
         eye_gpu_samples = 0u;

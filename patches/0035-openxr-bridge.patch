@@ -42,7 +42,7 @@ index d9882e8..de4af9d 100644
          int enables = int(push.viewport.w + 0.5);
          if ((enables & 2) != 0) light_vertex(frag_color, frag_specular);
 diff --git a/host/gpu/vulkan_renderer.cpp b/host/gpu/vulkan_renderer.cpp
-index ef4fcb8..a2ffebf 100644
+index ef4fcb8..75eb5e0 100644
 --- a/host/gpu/vulkan_renderer.cpp
 +++ b/host/gpu/vulkan_renderer.cpp
 @@ -5,6 +5,7 @@
@@ -53,7 +53,16 @@ index ef4fcb8..a2ffebf 100644
  #include "frame_pacing.hpp"
  #include "replacement_textures.hpp"
  #include "texture_decode.hpp"
-@@ -1732,6 +1733,38 @@ struct VulkanRenderer::Impl : host::SdlPad {
+@@ -1436,7 +1437,7 @@ struct VulkanRenderer::Impl : host::SdlPad {
+     std::filesystem::path pipeline_keys_path;
+     void prewarm_pipelines();
+     void save_pipeline_keys();
+-    [[nodiscard]] VkPipeline create_pipeline(const PipelineKey &key) const;
++    [[nodiscard]] VkPipeline create_pipeline(const PipelineKey &key, bool msaa = false) const;
+     // Every few seconds after a pipeline was created: saves the cache and
+     // says how many pipelines the game needed and what they cost.
+     void report_pipelines(bool final);
+@@ -1732,6 +1733,45 @@ struct VulkanRenderer::Impl : host::SdlPad {
      bool poll_presents(std::chrono::steady_clock::time_point now, bool account, bool idle);
      bool present_between(const pacing::PresentClock::Present &present, bool account);
      void replay(VkCommandBuffer commands, std::uint32_t slot, float t);
@@ -66,7 +75,7 @@ index ef4fcb8..a2ffebf 100644
 +    xr::StereoFrame stereo_frame{};
 +    double frame_end_ms{}, eye_submit_ms{};  // CPU time, summed until logged
 +    // MSAA for the eyes (stereo_replay.inc): a pass with multisampled colour and depth resolving into the eye
-+    // image, and a multisampled copy of each pipeline the eyes draw with (create_pipeline under msaa_build).
++    // image, and a multisampled copy of each pipeline the eyes draw with (create_pipeline(key, true)).
 +    struct EyeMsaa {
 +        VkImage color{}, depth{};
 +        VkDeviceMemory color_memory{}, depth_memory{};
@@ -76,8 +85,15 @@ index ef4fcb8..a2ffebf 100644
 +    std::array<EyeMsaa, 2> eye_msaa{};
 +    VkRenderPass eye_msaa_pass{};
 +    VkSampleCountFlagBits eye_samples{VK_SAMPLE_COUNT_1_BIT};
-+    mutable bool msaa_build{};
 +    std::map<VkPipeline, VkPipeline> msaa_pipelines;
++    // The twins of every pipeline known (this run's and the last runs' keys) made in the background once the
++    // MSAA pass exists, so a race does not stop to compile them (stereo_replay.inc, prewarm_msaa).
++    std::unique_ptr<Prewarm> msaa_prewarm = std::make_unique<Prewarm>();
++    bool msaa_prewarm_done{};  // under msaa_prewarm->lock
++    bool msaa_prewarm_saved{};
++    std::uint32_t msaa_new{}, msaa_from_prewarm{};
++    double msaa_new_ms{}, msaa_new_max_ms{};
++    void prewarm_msaa();
 +    bool create_eye_msaa();
 +    void destroy_eye_msaa();
 +    VkPipeline msaa_pipeline(VkPipeline pipeline);
@@ -92,7 +108,7 @@ index ef4fcb8..a2ffebf 100644
      void report_interpolation();
      void reset_interpolation();
      void destroy_interpolation_targets();
-@@ -1874,6 +1907,11 @@ struct VulkanRenderer::Impl : host::SdlPad {
+@@ -1874,6 +1914,11 @@ struct VulkanRenderer::Impl : host::SdlPad {
      bool recording{};
      bool quit{};
      bool ready{};
@@ -104,7 +120,7 @@ index ef4fcb8..a2ffebf 100644
      std::uint64_t frames{};
      std::uint64_t draws{};
  
-@@ -1926,12 +1964,17 @@ struct VulkanRenderer::Impl : host::SdlPad {
+@@ -1926,12 +1971,17 @@ struct VulkanRenderer::Impl : host::SdlPad {
          return memory;
      }
  
@@ -122,7 +138,7 @@ index ef4fcb8..a2ffebf 100644
          info.extent = {width, height, 1u};
          info.mipLevels = mip_levels;
          info.arrayLayers = 1u;
-@@ -1997,6 +2040,7 @@ struct VulkanRenderer::Impl : host::SdlPad {
+@@ -1997,6 +2047,7 @@ struct VulkanRenderer::Impl : host::SdlPad {
      }
      [[nodiscard]] VkPresentModeKHR wanted_present_mode() const;
      bool create_swapchain(std::string &error);
@@ -130,7 +146,7 @@ index ef4fcb8..a2ffebf 100644
      void destroy_swapchain_views();
      void recreate_swapchain();
  #if defined(__ANDROID__)
-@@ -2029,6 +2073,7 @@ struct VulkanRenderer::Impl : host::SdlPad {
+@@ -2029,6 +2080,7 @@ struct VulkanRenderer::Impl : host::SdlPad {
      // frame. So the swapchain is rebuilt only when the display's transform or
      // the window's size really changed: once per turn of the phone.
      void check_swapchain() {
@@ -138,7 +154,7 @@ index ef4fcb8..a2ffebf 100644
          if (!std::exchange(swapchain_check, false) || swapchain == VK_NULL_HANDLE) return;
  #if defined(__ANDROID__)
          VkSurfaceCapabilitiesKHR capabilities{};
-@@ -2337,6 +2382,21 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
+@@ -2337,6 +2389,21 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
          if (std::strcmp(extension.extensionName, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) == 0)
              portability_enumeration = true;
      if (portability_enumeration) extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
@@ -160,7 +176,7 @@ index ef4fcb8..a2ffebf 100644
  
      VkApplicationInfo application{VK_STRUCTURE_TYPE_APPLICATION_INFO};
      application.pApplicationName = portablekit::game().app_name;
-@@ -2377,6 +2437,9 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
+@@ -2377,6 +2444,9 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
          }
      }
  
@@ -170,7 +186,7 @@ index ef4fcb8..a2ffebf 100644
      std::uint32_t family_count = 0u;
      vkGetPhysicalDeviceQueueFamilyProperties(impl.physical_device, &family_count, nullptr);
      std::vector<VkQueueFamilyProperties> families(family_count);
-@@ -2411,14 +2474,20 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
+@@ -2411,14 +2481,20 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
              impl.breadcrumbs.available = true;
          }
      }
@@ -194,7 +210,7 @@ index ef4fcb8..a2ffebf 100644
      // <prefix>_CHECK_GPU_DECODE: the check build of the raw vertex shader
      // writes what it decoded to a storage buffer.
      VkPhysicalDeviceFeatures supported_features{};
-@@ -2473,6 +2542,14 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
+@@ -2473,6 +2549,14 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
      if (!check(vkCreateDevice(impl.physical_device, &device_info, nullptr, &impl.device), "vkCreateDevice", error))
          return false;
      vkGetDeviceQueue(impl.device, impl.queue_family, 0u, &impl.queue);
@@ -209,7 +225,7 @@ index ef4fcb8..a2ffebf 100644
      if (impl.breadcrumbs.available) {
          Impl::Breadcrumbs &b = impl.breadcrumbs;
          VkBufferCreateInfo marker_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-@@ -2520,6 +2597,7 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
+@@ -2520,6 +2604,7 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
          }
      }
      impl.swapchain_format = impl.surface_format.format;
@@ -217,7 +233,7 @@ index ef4fcb8..a2ffebf 100644
      std::uint32_t mode_count = 0u;
      vkGetPhysicalDeviceSurfacePresentModesKHR(impl.physical_device, impl.surface, &mode_count, nullptr);
      impl.present_modes.resize(mode_count);
-@@ -3070,6 +3148,7 @@ void VulkanRenderer::Impl::update_display_info() {
+@@ -3070,6 +3155,7 @@ void VulkanRenderer::Impl::update_display_info() {
          if (const SDL_DisplayMode *mode = SDL_GetCurrentDisplayMode(display); mode != nullptr)
              refresh = mode->refresh_rate;
      }
@@ -225,7 +241,7 @@ index ef4fcb8..a2ffebf 100644
      display_hz = refresh;
      perf::set_display_info(present_mode_name(present_mode), swapchain_extent.width, swapchain_extent.height, refresh);
  }
-@@ -3086,6 +3165,7 @@ VkPresentModeKHR VulkanRenderer::Impl::wanted_present_mode() const {
+@@ -3086,6 +3172,7 @@ VkPresentModeKHR VulkanRenderer::Impl::wanted_present_mode() const {
  
  // Builds the swapchain for the window's current size, replacing the old one.
  bool VulkanRenderer::Impl::create_swapchain(std::string &error) {
@@ -233,7 +249,7 @@ index ef4fcb8..a2ffebf 100644
      VkSurfaceCapabilitiesKHR capabilities{};
      vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface, &capabilities);
      VkExtent2D extent = capabilities.currentExtent;
-@@ -3194,6 +3274,60 @@ bool VulkanRenderer::Impl::create_swapchain(std::string &error) {
+@@ -3194,6 +3281,60 @@ bool VulkanRenderer::Impl::create_swapchain(std::string &error) {
      return true;
  }
  
@@ -294,7 +310,7 @@ index ef4fcb8..a2ffebf 100644
  void VulkanRenderer::Impl::destroy_swapchain_views() {
      for (VkFramebuffer framebuffer : ui_framebuffers) vkDestroyFramebuffer(device, framebuffer, nullptr);
      ui_framebuffers.clear();
-@@ -3226,6 +3360,7 @@ void VulkanRenderer::Impl::reset_surface() {
+@@ -3226,6 +3367,7 @@ void VulkanRenderer::Impl::reset_surface() {
  #endif
  
  void VulkanRenderer::Impl::recreate_swapchain() {
@@ -302,7 +318,7 @@ index ef4fcb8..a2ffebf 100644
      // A minimised window has no area to present to; keep the old swapchain
      // and try again once it has one.
      int width = 0;
-@@ -3535,11 +3670,15 @@ void VulkanRenderer::Impl::record_game_blit(VkCommandBuffer commands, VkImage so
+@@ -3535,11 +3677,15 @@ void VulkanRenderer::Impl::record_game_blit(VkCommandBuffer commands, VkImage so
  void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence fence, VkImage source,
                                                VkExtent2D source_extent, bool game_frame, bool main_frame) {
  #if defined(__ANDROID__)
@@ -321,7 +337,7 @@ index ef4fcb8..a2ffebf 100644
  #endif
      if (!acquired_image) {
          check_swapchain();
-@@ -3561,7 +3700,20 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
+@@ -3561,7 +3707,20 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
  
      std::uint32_t image_index = 0u;
      VkResult acquired = VK_ERROR_OUT_OF_DATE_KHR;
@@ -343,7 +359,7 @@ index ef4fcb8..a2ffebf 100644
          image_index = *acquired_image;
          acquired = VK_SUCCESS;
          acquired_image.reset();
-@@ -3587,8 +3739,13 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
+@@ -3587,8 +3746,13 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
  #if defined(__ANDROID__)
          if (prerotated() && image_index < upright_images.size()) target = upright_images[image_index].image;
  #endif
@@ -358,7 +374,7 @@ index ef4fcb8..a2ffebf 100644
              transition(commands, source, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
              record_game_blit(commands, source, source_extent, target);
-@@ -3601,7 +3758,7 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
+@@ -3601,7 +3765,7 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
              vkCmdClearColorImage(commands, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &background, 1u,
                                   &range);
          }
@@ -367,7 +383,7 @@ index ef4fcb8..a2ffebf 100644
              const perf::Clock::time_point overlay_start = perf::Clock::now();
              record_overlay(commands, target);
              perf::add_overlay_time(perf::Clock::now() - overlay_start);
-@@ -3645,20 +3802,35 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
+@@ -3645,20 +3809,35 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
                  capture = true;
              }
          }
@@ -404,7 +420,7 @@ index ef4fcb8..a2ffebf 100644
          submit.waitSemaphoreCount = 1u;
          submit.pWaitSemaphores = &acquire;
          submit.pWaitDstStageMask = &wait_stage;
-@@ -3670,7 +3842,11 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
+@@ -3670,7 +3849,11 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence
      if (vkQueueSubmit(queue, 1u, &submit, fence) == VK_ERROR_DEVICE_LOST) device_lost("a frame's submit");
      perf::add_wait_time(perf::Clock::now() - submit_start, perf::Stall::Submit);
  
@@ -417,11 +433,20 @@ index ef4fcb8..a2ffebf 100644
          VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
          present.waitSemaphoreCount = 1u;
          present.pWaitSemaphores = &render_finished[image_index];
-@@ -5305,6 +5481,11 @@ VkPipeline VulkanRenderer::Impl::create_pipeline(const PipelineKey &key) const {
+@@ -5159,7 +5342,7 @@ VkPipeline VulkanRenderer::Impl::pipeline_for(const PipelineKey &key) {
+ 
+ // The pipeline for `key`; touches nothing but immutable state and the
+ // (internally synchronised) pipeline cache, so the prewarm thread uses it too.
+-VkPipeline VulkanRenderer::Impl::create_pipeline(const PipelineKey &key) const {
++VkPipeline VulkanRenderer::Impl::create_pipeline(const PipelineKey &key, bool msaa) const {
+     std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
+     stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+@@ -5305,6 +5488,11 @@ VkPipeline VulkanRenderer::Impl::create_pipeline(const PipelineKey &key) const {
      info.pDynamicState = &dynamic_state;
      info.layout = pipeline_layout;
      info.renderPass = render_pass;
-+    if (msaa_build) {
++    if (msaa) {
 +        // The eyes' MSAA pass (xr_bridge.hpp, stereo_replay.inc).
 +        multisample.rasterizationSamples = eye_samples;
 +        info.renderPass = eye_msaa_pass;
@@ -429,7 +454,7 @@ index ef4fcb8..a2ffebf 100644
      VkPipeline pipeline{};
      if (vkCreateGraphicsPipelines(device, pipeline_cache, 1u, &info, nullptr, &pipeline) != VK_SUCCESS)
          return VK_NULL_HANDLE;
-@@ -5486,6 +5667,15 @@ std::string VulkanRenderer::device_name() const { return impl_ ? impl_->device_n
+@@ -5486,6 +5674,15 @@ std::string VulkanRenderer::device_name() const { return impl_ ? impl_->device_n
  SDL_Gamepad *VulkanRenderer::gamepad() const noexcept { return impl_ ? impl_->gamepad : nullptr; }
  
  VkExtent2D VulkanRenderer::Impl::wanted_target_extent() const {
@@ -445,7 +470,7 @@ index ef4fcb8..a2ffebf 100644
      const bool known = content_rect.extent.width != 0u && content_rect.extent.height != 0u;
      const double window_width = known ? content_rect.extent.width : static_cast<double>(target_extent.width);
      const double window_height = known ? content_rect.extent.height : static_cast<double>(target_extent.height);
-@@ -5906,7 +6096,7 @@ void VulkanRenderer::begin_frame() {
+@@ -5906,7 +6103,7 @@ void VulkanRenderer::begin_frame() {
      }
      // With frame interpolation each frame writes the next region and is
      // recorded for drawing again; without it, the first region as before.
@@ -454,7 +479,7 @@ index ef4fcb8..a2ffebf 100644
      const std::uint32_t region = impl.interpolating ? impl.next_region : impl.slot;
      // A region another frame in flight, or a present between flips, may
      // still draw from is waited for first (only when interpolation has just
-@@ -7719,6 +7909,7 @@ double VulkanRenderer::Impl::wanted_rate() const {
+@@ -7719,6 +7916,7 @@ double VulkanRenderer::Impl::wanted_rate() const {
  }
  
  bool VulkanRenderer::Impl::interpolation_wanted() const {
@@ -462,7 +487,7 @@ index ef4fcb8..a2ffebf 100644
      // Emulated time running ahead of real time already presents faster than
      // the game's own rate; the keyboard's held frame is shown as it is.
      return frame_rate != settings::FrameRate::Fps30 && !settings::current().unthrottled && !holding && !fast_forward &&
-@@ -8050,6 +8241,795 @@ bool VulkanRenderer::Impl::present_between(const pacing::PresentClock::Present &
+@@ -8050,6 +8248,864 @@ bool VulkanRenderer::Impl::present_between(const pacing::PresentClock::Present &
      return true;
  }
  
@@ -596,8 +621,9 @@ index ef4fcb8..a2ffebf 100644
 +//
 +// PURE_VR_MSAA=2 (the default), 4 or 0 (off). The eyes draw into multisampled colour and depth (lazily allocated
 +// where the GPU has such memory: on a tiler they stay in tile memory) and resolve into the eye image at the end of
-+// the pass. The game's pipelines are single-sampled, so each one the eyes use gets a multisampled twin, made from
-+// its key the first time (and kept in the pipeline cache for the next run).
++// the pass. The game's pipelines are single-sampled, so each one the eyes use gets a multisampled twin: made in the
++// background for every key known when the pass is first built (prewarm_msaa), else from its key the first time it
++// is drawn; the pipeline cache keeps them for the next run.
 +
 +bool VulkanRenderer::Impl::create_eye_msaa() {
 +    if (eye_msaa_pass != VK_NULL_HANDLE && eye_msaa[0].framebuffer != VK_NULL_HANDLE) return true;
@@ -729,7 +755,42 @@ index ef4fcb8..a2ffebf 100644
 +    }
 +    std::cout << "[vr] eyes with " << static_cast<int>(eye_samples) << "x MSAA (" << (lazy_used ? "tile memory" : "device memory")
 +              << ")\n";
++    prewarm_msaa();
 +    return true;
++}
++
++// The twins of the pipelines made this run (first: the race's), then of those the start-up prewarm made from the
++// last runs' list, on a thread of their own; msaa_pipeline takes them from there. PURE_NO_PIPELINE_PREWARM turns it
++// off with the other prewarm.
++void VulkanRenderer::Impl::prewarm_msaa() {
++    if (msaa_prewarm->thread.joinable() || portablekit::env("NO_PIPELINE_PREWARM") != nullptr) return;
++    std::vector<PipelineKey> keys;
++    for (const auto &[key, pipeline] : pipelines) keys.push_back(key);
++    {
++        std::lock_guard<std::mutex> guard(prewarm->lock);
++        for (const auto &[key, pipeline] : prewarm->made) keys.push_back(key);
++    }
++    msaa_prewarm->thread = std::thread([this, keys = std::move(keys)] {
++        const auto start = std::chrono::steady_clock::now();
++        std::uint32_t made = 0u;
++        for (const PipelineKey &key : keys) {
++            if (msaa_prewarm->stop.load(std::memory_order_relaxed)) break;
++            {
++                std::lock_guard<std::mutex> guard(msaa_prewarm->lock);
++                if (msaa_prewarm->made.contains(key)) continue;
++            }
++            const VkPipeline pipeline = create_pipeline(key, true);
++            if (pipeline == VK_NULL_HANDLE) continue;
++            std::lock_guard<std::mutex> guard(msaa_prewarm->lock);
++            if (!msaa_prewarm->made.emplace(key, pipeline).second) vkDestroyPipeline(device, pipeline, nullptr);
++            ++made;
++        }
++        std::printf("[vr] %u MSAA pipelines made in the background in %.1f ms\n", made,
++                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
++        std::fflush(stdout);
++        std::lock_guard<std::mutex> guard(msaa_prewarm->lock);
++        msaa_prewarm_done = true;
++    });
 +}
 +
 +void VulkanRenderer::Impl::destroy_eye_msaa() {
@@ -750,10 +811,37 @@ index ef4fcb8..a2ffebf 100644
 +    VkPipeline made = VK_NULL_HANDLE;
 +    for (const auto &[key, single] : pipelines) {
 +        if (single != pipeline) continue;
-+        msaa_build = true;
-+        made = create_pipeline(key);
-+        msaa_build = false;
++        {
++            std::lock_guard<std::mutex> guard(msaa_prewarm->lock);
++            if (const auto ready = msaa_prewarm->made.find(key); ready != msaa_prewarm->made.end()) {
++                made = ready->second;
++                msaa_prewarm->made.erase(ready);
++                ++msaa_from_prewarm;
++            }
++        }
++        if (made == VK_NULL_HANDLE) {
++            // Not made in the background (yet): made here, which the frame waits for, and counted.
++            const auto start = std::chrono::steady_clock::now();
++            made = create_pipeline(key, true);
++            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
++            ++msaa_new;
++            msaa_new_ms += ms;
++            msaa_new_max_ms = std::max(msaa_new_max_ms, ms);
++            pipeline_cache_dirty = true;
++            pipeline_cache_changed = std::chrono::steady_clock::now();
++        }
 +        break;
++    }
++    // The background's twins go into the pipeline cache file with the next save.
++    bool background_done = false;
++    if (!msaa_prewarm_saved) {
++        std::lock_guard<std::mutex> guard(msaa_prewarm->lock);
++        background_done = msaa_prewarm_done;
++    }
++    if (background_done) {
++        msaa_prewarm_saved = true;
++        pipeline_cache_dirty = true;
++        pipeline_cache_changed = std::chrono::steady_clock::now();
 +    }
 +    msaa_pipelines.emplace(pipeline, made);
 +    return made;
@@ -1235,6 +1323,12 @@ index ef4fcb8..a2ffebf 100644
 +                        frame_end_ms / static_cast<double>(eye_gpu_samples),
 +                        eye_submit_ms / static_cast<double>(eye_gpu_samples), target_extent.width,
 +                        target_extent.height);
++        if (msaa_new != 0u || msaa_from_prewarm != 0u) {
++            std::printf("[vr] MSAA pipelines: %u from the background, %u made in the frame (%.1f ms, the longest %.1f)\n",
++                        msaa_from_prewarm, msaa_new, msaa_new_ms, msaa_new_max_ms);
++            msaa_from_prewarm = msaa_new = 0u;
++            msaa_new_ms = msaa_new_max_ms = 0.0;
++        }
 +        frame_end_ms = eye_submit_ms = 0.0;
 +        eye_gpu_ms = 0.0;
 +        eye_gpu_samples = 0u;
@@ -1258,7 +1352,7 @@ index ef4fcb8..a2ffebf 100644
  // Draws the older frame into the slot's blend target with every matched
  // draw's transforms blended a fraction `t` towards the newer frame's. Draws
  // without a partner in the newer frame, and those never blended (2D, the
-@@ -8464,6 +9444,8 @@ void VulkanRenderer::Impl::reset_interpolation() {
+@@ -8464,6 +9520,8 @@ void VulkanRenderer::Impl::reset_interpolation() {
  void VulkanRenderer::Impl::destroy_interpolation_targets() {
      for (Target &picture : pictures) destroy_target(picture);
      for (Target &target : blend_targets) destroy_target(target);
@@ -1267,7 +1361,7 @@ index ef4fcb8..a2ffebf 100644
      older_picture_valid = newer_picture_valid = false;
  }
  
-@@ -8646,8 +9628,14 @@ bool VulkanRenderer::present(std::uint32_t display_address,
+@@ -8646,8 +9704,14 @@ bool VulkanRenderer::present(std::uint32_t display_address,
          impl.poll_presents(std::chrono::steady_clock::now(), false, false);
          return false;
      }
@@ -1284,6 +1378,15 @@ index ef4fcb8..a2ffebf 100644
      if (impl.fast_forward) {
          // A load running fast: the flip is drawn, and shown only when the
          // window has not had a picture for a while, so the display's refresh
+@@ -8883,6 +9947,8 @@ void VulkanRenderer::shutdown() {
+     vkFreeMemory(impl.device, impl.breadcrumbs.memory, nullptr);
+     impl.prewarm->stop = true;
+     if (impl.prewarm->thread.joinable()) impl.prewarm->thread.join();
++    impl.msaa_prewarm->stop = true;
++    if (impl.msaa_prewarm->thread.joinable()) impl.msaa_prewarm->thread.join();
+     if (impl.pipelines_prewarm_used != 0u)
+         std::cout << "[render] " << impl.pipelines_prewarm_used << " pipelines came from the background prewarm\n";
+     impl.report_pipelines(true);
 diff --git a/host/gpu/xr_bridge.hpp b/host/gpu/xr_bridge.hpp
 new file mode 100644
 index 0000000..d3b9d76

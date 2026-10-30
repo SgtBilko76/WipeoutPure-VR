@@ -407,7 +407,7 @@ edit(R, "    void replay(VkCommandBuffer commands, std::uint32_t slot, float t);
      "    xr::StereoFrame stereo_frame{};\n"
      "    double frame_end_ms{}, eye_submit_ms{};  // CPU time, summed until logged\n"
      "    // MSAA for the eyes (stereo_replay.inc): a pass with multisampled colour and depth resolving into the eye\n"
-     "    // image, and a multisampled copy of each pipeline the eyes draw with (create_pipeline under msaa_build).\n"
+     "    // image, and a multisampled copy of each pipeline the eyes draw with (create_pipeline(key, true)).\n"
      "    struct EyeMsaa {\n"
      "        VkImage color{}, depth{};\n"
      "        VkDeviceMemory color_memory{}, depth_memory{};\n"
@@ -417,8 +417,15 @@ edit(R, "    void replay(VkCommandBuffer commands, std::uint32_t slot, float t);
      "    std::array<EyeMsaa, 2> eye_msaa{};\n"
      "    VkRenderPass eye_msaa_pass{};\n"
      "    VkSampleCountFlagBits eye_samples{VK_SAMPLE_COUNT_1_BIT};\n"
-     "    mutable bool msaa_build{};\n"
      "    std::map<VkPipeline, VkPipeline> msaa_pipelines;\n"
+     "    // The twins of every pipeline known (this run's and the last runs' keys) made in the background once the\n"
+     "    // MSAA pass exists, so a race does not stop to compile them (stereo_replay.inc, prewarm_msaa).\n"
+     "    std::unique_ptr<Prewarm> msaa_prewarm = std::make_unique<Prewarm>();\n"
+     "    bool msaa_prewarm_done{};  // under msaa_prewarm->lock\n"
+     "    bool msaa_prewarm_saved{};\n"
+     "    std::uint32_t msaa_new{}, msaa_from_prewarm{};\n"
+     "    double msaa_new_ms{}, msaa_new_max_ms{};\n"
+     "    void prewarm_msaa();\n"
      "    bool create_eye_msaa();\n"
      "    void destroy_eye_msaa();\n"
      "    VkPipeline msaa_pipeline(VkPipeline pipeline);\n"
@@ -535,12 +542,22 @@ edit(R, "        info.format = format;\n        info.extent = {width, height, 1u
 edit(A, "constexpr const char *kBundledFonts[] = {\"NotoSansCJKjp-Regular.otf\"};\n",
      "constexpr const char *kBundledFonts[] = {\"DejaVuSans.ttf\", \"NotoSansCJKjp-Regular.otf\"};\n")
 
-# A multisampled pipeline for the eyes' MSAA pass (msaa_pipeline).
+# A multisampled pipeline for the eyes' MSAA pass (msaa_pipeline), chosen by an argument: the background prewarms
+# call create_pipeline on threads of their own.
+edit(R, "    [[nodiscard]] VkPipeline create_pipeline(const PipelineKey &key) const;\n",
+     "    [[nodiscard]] VkPipeline create_pipeline(const PipelineKey &key, bool msaa = false) const;\n")
+edit(R, "VkPipeline VulkanRenderer::Impl::create_pipeline(const PipelineKey &key) const {\n",
+     "VkPipeline VulkanRenderer::Impl::create_pipeline(const PipelineKey &key, bool msaa) const {\n")
+# The MSAA prewarm stops and joins with the other one.
+edit(R, "    impl.prewarm->stop = true;\n    if (impl.prewarm->thread.joinable()) impl.prewarm->thread.join();\n",
+     "    impl.prewarm->stop = true;\n    if (impl.prewarm->thread.joinable()) impl.prewarm->thread.join();\n"
+     "    impl.msaa_prewarm->stop = true;\n"
+     "    if (impl.msaa_prewarm->thread.joinable()) impl.msaa_prewarm->thread.join();\n")
 edit(R, "    info.layout = pipeline_layout;\n    info.renderPass = render_pass;\n    VkPipeline pipeline{};\n"
         "    if (vkCreateGraphicsPipelines(device, pipeline_cache, 1u, &info, nullptr, &pipeline) != VK_SUCCESS)\n"
         "        return VK_NULL_HANDLE;\n    return pipeline;\n}\n\nbool VulkanRenderer::pump_events() {\n",
      "    info.layout = pipeline_layout;\n    info.renderPass = render_pass;\n"
-     "    if (msaa_build) {\n"
+     "    if (msaa) {\n"
      "        // The eyes' MSAA pass (xr_bridge.hpp, stereo_replay.inc).\n"
      "        multisample.rasterizationSamples = eye_samples;\n"
      "        info.renderPass = eye_msaa_pass;\n"
