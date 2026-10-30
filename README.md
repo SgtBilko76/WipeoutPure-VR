@@ -1,5 +1,11 @@
 # Wipeout Pure: Recompiled
 
+> **This fork is Wipeout Pure VR for Meta Quest and PICO:** races in stereo 3D with head tracking, the HD texture
+> pack downloaded by the app, Touch and PICO controllers. Install guide and controls: **[README-QUEST.md](README-QUEST.md)**.
+> **Download, install guide, controls and pictures: [portroyale.online/wipeoutpure.html](https://portroyale.online/wipeoutpure.html)**
+>
+> The rest of this page is the original pure-recomp read-me (macOS and Windows).
+
 pure-recomp is a native port of **Wipeout Pure** (PSP, Studio Liverpool, 2005) for Apple Silicon Macs and Windows,
 made by static recompilation: the game's code is translated ahead of time into a program that runs directly on
 your machine, with its graphics drawn by Metal on macOS and Vulkan on Windows. It is not an emulator, and the

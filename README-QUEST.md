@@ -1,5 +1,7 @@
 # Wipeout Pure VR (Meta Quest + PICO)
 
+**Download, install guide, controls and pictures: [portroyale.online/wipeoutpure.html](https://portroyale.online/wipeoutpure.html)**
+
 A standalone VR port of **Wipeout Pure** (PSP, Studio Liverpool, 2005) for Meta Quest and PICO headsets, built on
 [pure-recomp](https://github.com/erreib/pure-recomp), a native port of the game made by static recompilation (no
 emulator). Races run in stereo 3D around you with head tracking; the menus, movies and the port's settings are on a
