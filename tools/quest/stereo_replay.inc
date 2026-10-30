@@ -154,12 +154,22 @@ bool VulkanRenderer::Impl::begin_stereo() {
     stereo_ready = false;
     const VkExtent2D extent = xr::bridge()->stereo_extent();
     if (extent.width == 0u || extent.height == 0u) return false;
+    // PURE_VR_EYE_COPY=unorm: eye images stored as UNORM, as before (a copy between formats).
+    static const bool srgb_eyes = [] {
+        const char *text = portablekit::env("VR_EYE_COPY");
+        const bool srgb = text == nullptr || std::strcmp(text, "unorm") != 0;
+        std::printf("[vr] eye images stored as %s\n", srgb ? "sRGB (viewed as UNORM)" : "UNORM");
+        return srgb;
+    }();
     for (Target &target : eye_targets) {
         if (target.color != VK_NULL_HANDLE) continue;
         target = Target{};
         target.extent = extent;
         std::string error;
-        if (!create_target(target, error)) {
+        srgb_storage = srgb_eyes;
+        const bool created = create_target(target, error);
+        srgb_storage = false;
+        if (!created) {
             std::cout << "[vr] no room for the eye images: " << error << "\n";
             destroy_target(target);
             return false;

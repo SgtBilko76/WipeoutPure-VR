@@ -500,4 +500,18 @@ edit(R, "    vkEndCommandBuffer(commands);\n\n    const VkPipelineStageFlags wai
      "        frame_end_ms += std::chrono::duration<double, std::milli>(perf::Clock::now() - end_start).count();\n\n"
      "    const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;\n")
 
+# Eye images stored as sRGB and drawn through a UNORM view (the bytes the game writes, unchanged): their copy into
+# the headset's sRGB swapchain is then one of equal formats, which the Adreno driver makes without allocating
+# memory for every copy (a UNORM -> sRGB copy cost ~3 ms of CPU a frame in kgsl allocations).
+edit(R, "    bool create_image(std::uint32_t width, std::uint32_t height, VkFormat format, VkImageUsageFlags usage,\n",
+     "    bool srgb_storage{};  // create_image: an R8G8B8A8_UNORM image stored as sRGB, viewed as UNORM (xr_bridge.hpp)\n"
+     "    bool create_image(std::uint32_t width, std::uint32_t height, VkFormat format, VkImageUsageFlags usage,\n")
+edit(R, "        info.format = format;\n        info.extent = {width, height, 1u};\n        info.mipLevels = mip_levels;\n",
+     "        info.format = format;\n"
+     "        if (srgb_storage && format == VK_FORMAT_R8G8B8A8_UNORM) {\n"
+     "            info.format = VK_FORMAT_R8G8B8A8_SRGB;\n"
+     "            info.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;\n"
+     "        }\n"
+     "        info.extent = {width, height, 1u};\n        info.mipLevels = mip_levels;\n")
+
 print("changed:", sorted(set(changed)) or "nothing (already applied)")
