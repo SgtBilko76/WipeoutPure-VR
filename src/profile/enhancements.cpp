@@ -10,6 +10,11 @@
 #endif
 #if defined(PURE_QUEST_VR)
 #include "gpu/xr_bridge.hpp"
+
+#include <sys/stat.h>
+
+#include <cstdio>
+#include <string>
 #endif
 
 #include <algorithm>
@@ -226,6 +231,40 @@ void thirty_fps(psprecomp::GuestMemory &m) {
 }
 #endif
 
+#if defined(PURE_QUEST_VR)
+// Test-only (PURE_VR_DUMP_VIEW=1): the user RAM written to files/dumps/ at each press of the view button (the Touch
+// Y, the gamepad's Back: Select) and again a second later, so a diff of the dumps finds the camera view's state.
+void dump_on_view_press(const psprecomp::GuestMemory &m) {
+    static const bool on = env("VR_DUMP_VIEW") != nullptr;
+    if (!on || portablekit::gpu::xr::bridge() == nullptr) return;
+    constexpr int kBack = 4;  // SDL_GAMEPAD_BUTTON_BACK
+    static bool held = false;
+    static int countdown = -1;
+    static int index = 0;
+    const auto dump = [&m](const char *when) {
+        const char *dir = std::getenv("PURE_DATA_DIR");
+        if (dir == nullptr) return;
+        const std::string path = std::string(dir) + "/dumps";
+        ::mkdir(path.c_str(), 0775);
+        const std::uint8_t *bytes = m.raw_pointer(kUserBase, kUserEnd - kUserBase);
+        if (bytes == nullptr) return;
+        const std::string file = path + "/view_" + std::to_string(index++) + "_" + when + ".bin";
+        if (FILE *out = std::fopen(file.c_str(), "wb")) {
+            std::fwrite(bytes, 1, kUserEnd - kUserBase, out);
+            std::fclose(out);
+            std::cout << "[pure] VR: dumped user RAM to " << file << "\n";
+        }
+    };
+    const bool pressed = portablekit::gpu::xr::bridge()->button(kBack);
+    if (pressed && !held && countdown < 0) {
+        dump("before");
+        countdown = 60;
+    }
+    held = pressed;
+    if (countdown >= 0 && countdown-- == 0) dump("after");
+}
+#endif
+
 // E6: the flash countdown cleared in a free-running frame.
 void smooth_flashes(psprecomp::GuestMemory &m) {
     const std::uint32_t frame = m.load32(kFrameObjectPtr);
@@ -322,6 +361,7 @@ void wrap_draw_sync(HleRegistrar &hle) {
 #if defined(PURE_QUEST_VR)
         // The headset shows a race in stereo, the frontend on its screen (xr_bridge.hpp).
         portablekit::gpu::xr::set_scene_3d(race_backend(m));
+        dump_on_view_press(m);
 #endif
         shield_step::frame(rt);  // task 107: the shield effect's override, once the race runs faster than the PSP
 #if defined(PURE_QUEST_VR)

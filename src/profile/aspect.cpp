@@ -22,7 +22,12 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
+
+#if defined(PURE_QUEST_VR)
+#include "gpu/xr_bridge.hpp"
+#endif
 
 namespace portablekit::aspect {
 namespace {
@@ -51,9 +56,28 @@ struct Count {
 };
 Count counts[2];
 
+#if defined(PURE_QUEST_VR)
+// The headset: the eyes see far more than the game's 65 degrees (and turn with the head), so the race camera gets a
+// wide field of view and the game draws what lies around it, not only ahead. The eyes take their own field of view
+// from the headset and only the projection's depth from the game, so the picture itself does not widen; the game's
+// own frame (not shown in a race) and its screen-space effects stay consistent with it. PURE_VR_FOV names the
+// vertical angle in degrees (default 110; 0 or the game's own leaves it alone).
+float vr_fov_radians() {
+    static const float radians = [] {
+        const char *text = std::getenv("PURE_VR_FOV");
+        const float degrees = text != nullptr ? std::strtof(text, nullptr) : 110.0f;
+        return degrees >= 30.0f && degrees <= 160.0f ? degrees * 3.14159265f / 180.0f : 0.0f;
+    }();
+    return radians;
+}
+#endif
+
 void perspective(psprecomp::CorpusRuntime &rt, psprecomp::AllegrexContext &ctx) {
     Count &count = counts[ctx.gpr[31] == kRaceCameraReturn ? 0 : 1];
     ++count.calls;
+#if defined(PURE_QUEST_VR)
+    if (ctx.gpr[31] == kRaceCameraReturn && vr_fov_radians() > ctx.fpr[12]) ctx.fpr[12] = vr_fov_radians();
+#endif
     if (is_psp(ctx.fpr[13]) && !is_psp(view_aspect)) {
         ctx.fpr[13] = view_aspect;
         ++count.widened;
@@ -131,8 +155,13 @@ void trace() {
 void view_aspect_frame(psprecomp::Runtime &rt, float aspect) {
     enum class State { Waiting, In, Off };
     static State state = State::Waiting;
+#if defined(PURE_QUEST_VR)
+    const bool vr = vr_fov_radians() > 0.0f;
+#else
+    const bool vr = false;
+#endif
     if (state == State::Waiting) {
-        if (is_psp(aspect) && !trace_on()) return;
+        if (is_psp(aspect) && !trace_on() && !vr) return;
         state = install(rt) ? State::In : State::Off;
     }
     if (state != State::In) return;
@@ -148,6 +177,23 @@ void view_aspect_frame(psprecomp::Runtime &rt, float aspect) {
         rt.memory().store32(kTanHalfX, std::bit_cast<std::uint32_t>(pure::load_float(rt.memory(), kTanHalfY) * kPspAspect));
         tangent_changed = false;
     }
+#if defined(PURE_QUEST_VR)
+    // In a race the camera's tangents follow the wide angle, so the game's culling keeps what the eyes can see.
+    if (vr && portablekit::gpu::xr::scene_3d()) {
+        const float wide_y = std::tan(0.5f * vr_fov_radians());
+        const float tan_y = pure::load_float(rt.memory(), kTanHalfY);
+        if (std::isfinite(tan_y) && tan_y > 0.0f && tan_y < wide_y) {
+            rt.memory().store32(kTanHalfY, std::bit_cast<std::uint32_t>(wide_y));
+            rt.memory().store32(kTanHalfX, std::bit_cast<std::uint32_t>(wide_y * view_aspect));
+            static bool announced = false;
+            if (!announced) {
+                announced = true;
+                std::cout << "[aspect] VR: the race camera at " << vr_fov_radians() * 180.0f / 3.14159265f
+                          << " degrees (tangents " << tan_y << " -> " << wide_y << ")\n";
+            }
+        }
+    }
+#endif
     trace();
 }
 

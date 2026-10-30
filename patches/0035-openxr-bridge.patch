@@ -42,7 +42,7 @@ index d9882e8..de4af9d 100644
          int enables = int(push.viewport.w + 0.5);
          if ((enables & 2) != 0) light_vertex(frag_color, frag_specular);
 diff --git a/host/gpu/vulkan_renderer.cpp b/host/gpu/vulkan_renderer.cpp
-index ef4fcb8..ee5a488 100644
+index ef4fcb8..288fd09 100644
 --- a/host/gpu/vulkan_renderer.cpp
 +++ b/host/gpu/vulkan_renderer.cpp
 @@ -5,6 +5,7 @@
@@ -434,7 +434,7 @@ index ef4fcb8..ee5a488 100644
      // Emulated time running ahead of real time already presents faster than
      // the game's own rate; the keyboard's held frame is shown as it is.
      return frame_rate != settings::FrameRate::Fps30 && !settings::current().unthrottled && !holding && !fast_forward &&
-@@ -8050,6 +8220,616 @@ bool VulkanRenderer::Impl::present_between(const pacing::PresentClock::Present &
+@@ -8050,6 +8220,660 @@ bool VulkanRenderer::Impl::present_between(const pacing::PresentClock::Present &
      return true;
  }
  
@@ -720,36 +720,54 @@ index ef4fcb8..ee5a488 100644
 +
 +    static const float scale = vr_setting("VR_UNITS_PER_METRE", 1.0f, 0.001f, 100000.0f);
 +    static const float hud_distance = vr_setting("VR_HUD_DISTANCE", 2.0f, 0.3f, 50.0f);
-+    static const float hud_width = vr_setting("VR_HUD_WIDTH", 1.8f, 0.1f, 50.0f);
++    static const float hud_width = vr_setting("VR_HUD_WIDTH", 1.6f, 0.1f, 50.0f);
 +    const EyeMatrix from_reference = eye_from_reference(view, scale);
 +    const float width = static_cast<float>(target.extent.width);
 +    const float height = static_cast<float>(target.extent.height);
 +
-+    // The interface's rectangle: a plane hud_distance ahead of the head,
-+    // centred between the eyes, hud_width wide, as tall as the PSP's screen.
-+    const xr::EyeView &other = stereo.eyes[eye ^ 1u];
-+    const float dx = view.position[0] - other.position[0];
-+    const float dy = view.position[1] - other.position[1];
-+    const float dz = view.position[2] - other.position[2];
-+    const float half_ipd = 0.5f * std::sqrt(dx * dx + dy * dy + dz * dz);
-+    const float eye_x = eye == 0u ? -half_ipd : half_ipd;
-+    const auto pixel_x = [&](float metres) {
-+        const float ndc = (2.0f * metres / hud_distance - (view.tan_right + view.tan_left)) /
-+                          (view.tan_right - view.tan_left);
-+        return (ndc + 1.0f) * 0.5f * width;
-+    };
-+    const auto pixel_y = [&](float metres) {
-+        const float ndc = (2.0f * metres / hud_distance - (view.tan_up + view.tan_down)) / (view.tan_up - view.tan_down);
-+        return (1.0f - ndc) * 0.5f * height;
-+    };
++    // The interface: a plane fixed in the room (the reference space, like the screen in the menus), hud_distance
++    // ahead of where the head was at the start, hud_height below it, hud_width wide and the PSP's shape. Each 2D
++    // draw goes from the PSP's clip space onto that plane and from there into the eye. Its depth keeps the draw's
++    // own, scaled by the plane's distance (an eye's w differs from it by a few percent at most).
++    static const float hud_height = vr_setting("VR_HUD_HEIGHT", -0.15f, -5.0f, 5.0f);
++    const EyeMatrix hud_view = eye_from_reference(view, 1.0f);
++    EyeMatrix hud_projection{};  // OpenXR's eye space (x right, y up, -z ahead) to the eye image's clip space (y down)
++    {
++        const float sx = view.tan_right - view.tan_left, sy = view.tan_up - view.tan_down;
++        hud_projection[0] = 2.0f / sx;
++        hud_projection[8] = (view.tan_right + view.tan_left) / sx;
++        hud_projection[5] = -2.0f / sy;
++        hud_projection[9] = -(view.tan_up + view.tan_down) / sy;
++        hud_projection[11] = -1.0f;
++    }
 +    const float half_width = 0.5f * hud_width;
 +    const float half_height = half_width * static_cast<float>(kPspHeight) / static_cast<float>(kPspWidth);
-+    const float hud_left = pixel_x(-half_width - eye_x), hud_right = pixel_x(half_width - eye_x);
-+    const float hud_top = pixel_y(half_height), hud_bottom = pixel_y(-half_height);
++    EyeMatrix hud_plane{};  // the PSP's clip x (right) and y (down) to the plane
++    hud_plane[0] = half_width;
++    hud_plane[5] = -half_height;
++    hud_plane[13] = hud_height;
++    hud_plane[14] = -hud_distance;
++    hud_plane[15] = 1.0f;
++    const EyeMatrix hud_base = interpolation::multiply(hud_projection, interpolation::multiply(hud_view, hud_plane));
++    EyeMatrix through_clip{};  // a through draw's PSP pixels to its clip space
++    through_clip[0] = 2.0f / static_cast<float>(kPspWidth);
++    through_clip[5] = 2.0f / static_cast<float>(kPspHeight);
++    through_clip[12] = -1.0f;
++    through_clip[13] = -1.0f;
++    through_clip[15] = 1.0f;
++    const EyeMatrix hud_through = interpolation::multiply(hud_base, through_clip);
++    // Where a point of the PSP's clip space lands in the eye image, in pixels.
++    const auto hud_pixel = [&](float cx, float cy) {
++        const float x = hud_base[0] * cx + hud_base[4] * cy + hud_base[12];
++        const float y = hud_base[1] * cx + hud_base[5] * cy + hud_base[13];
++        const float w = std::max(1e-3f, hud_base[3] * cx + hud_base[7] * cy + hud_base[15]);
++        return std::array<float, 2>{(x / w + 1.0f) * 0.5f * width, (y / w + 1.0f) * 0.5f * height};
++    };
++    const std::array<float, 2> hud_top_left = hud_pixel(-1.0f, -1.0f), hud_bottom_right = hud_pixel(1.0f, 1.0f);
++    const float hud_left = hud_top_left[0], hud_right = hud_bottom_right[0];
++    const float hud_top = hud_top_left[1], hud_bottom = hud_bottom_right[1];
 +    VkExtent2D source = target_extent;
 +    if (const auto shown = targets.find(frame.displayed); shown != targets.end()) source = shown->second.extent;
-+    const float scissor_x = (hud_right - hud_left) / static_cast<float>(std::max(1u, source.width));
-+    const float scissor_y = (hud_bottom - hud_top) / static_cast<float>(std::max(1u, source.height));
 +    const VkRect2D all{{0, 0}, target.extent};
 +
 +    DrawState set{};
@@ -971,20 +989,46 @@ index ef4fcb8..ee5a488 100644
 +                            static_cast<double>(sx), static_cast<double>(sy), static_cast<double>(sz),
 +                            summary.texture_address);
 +            }
-+            state.viewport = {hud_left, hud_top, hud_right - hud_left, hud_bottom - hud_top, min_depth, max_depth};
-+            const float x0 = std::clamp(hud_left + static_cast<float>(drawn.state.scissor.offset.x) * scissor_x, 0.0f, width);
-+            const float y0 = std::clamp(hud_top + static_cast<float>(drawn.state.scissor.offset.y) * scissor_y, 0.0f, height);
-+            const float x1 = std::clamp(hud_left + static_cast<float>(drawn.state.scissor.offset.x +
-+                                                                      static_cast<std::int32_t>(drawn.state.scissor.extent.width)) *
-+                                                       scissor_x,
-+                                        0.0f, width);
-+            const float y1 = std::clamp(hud_top + static_cast<float>(drawn.state.scissor.offset.y +
-+                                                                     static_cast<std::int32_t>(drawn.state.scissor.extent.height)) *
-+                                                      scissor_y,
-+                                        0.0f, height);
-+            state.scissor = {{static_cast<std::int32_t>(x0), static_cast<std::int32_t>(y0)},
-+                             {static_cast<std::uint32_t>(std::max(0.0f, x1 - x0)),
-+                              static_cast<std::uint32_t>(std::max(0.0f, y1 - y0))}};
++            // Onto the interface's plane: a through draw by its pixels (ge.vert's placed path), a transformed one by
++            // its own clip space; z keeps the draw's own depth.
++            EyeMatrix placed{};
++            if (summary.through) {
++                placed = hud_through;
++                placed[2] = placed[6] = placed[10] = placed[14] = 0.0f;
++                placed[10] = hud_distance / 65535.0f;
++                state.push.viewport[2] = 2.0f;
++            } else {
++                const EyeMatrix &own = drawn.state.push.transform;
++                placed = interpolation::multiply(hud_base, own);
++                for (std::size_t column = 0; column < 4u; ++column)
++                    placed[column * 4u + 2u] = hud_distance * own[column * 4u + 2u];
++            }
++            state.push.transform = placed;
++            state.viewport = {0.0f, 0.0f, width, height, min_depth, max_depth};
++            // The draw's scissor (in the flat frame's pixels), as the box its corners make on the plane.
++            const VkRect2D &cut = drawn.state.scissor;
++            const bool whole_cut = cut.offset.x <= 0 && cut.offset.y <= 0 &&
++                                   cut.offset.x + static_cast<std::int32_t>(cut.extent.width) >=
++                                       static_cast<std::int32_t>(source.width) &&
++                                   cut.offset.y + static_cast<std::int32_t>(cut.extent.height) >=
++                                       static_cast<std::int32_t>(source.height);
++            if (whole_cut) {
++                state.scissor = all;
++            } else {
++                const float cx0 = 2.0f * static_cast<float>(cut.offset.x) / static_cast<float>(source.width) - 1.0f;
++                const float cy0 = 2.0f * static_cast<float>(cut.offset.y) / static_cast<float>(source.height) - 1.0f;
++                const float cx1 = cx0 + 2.0f * static_cast<float>(cut.extent.width) / static_cast<float>(source.width);
++                const float cy1 = cy0 + 2.0f * static_cast<float>(cut.extent.height) / static_cast<float>(source.height);
++                float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
++                for (const auto &corner : {hud_pixel(cx0, cy0), hud_pixel(cx1, cy0), hud_pixel(cx0, cy1), hud_pixel(cx1, cy1)}) {
++                    x0 = std::min(x0, corner[0]), x1 = std::max(x1, corner[0]);
++                    y0 = std::min(y0, corner[1]), y1 = std::max(y1, corner[1]);
++                }
++                x0 = std::clamp(std::floor(x0), 0.0f, width), x1 = std::clamp(std::ceil(x1), 0.0f, width);
++                y0 = std::clamp(std::floor(y0), 0.0f, height), y1 = std::clamp(std::ceil(y1), 0.0f, height);
++                state.scissor = {{static_cast<std::int32_t>(x0), static_cast<std::int32_t>(y0)},
++                                 {static_cast<std::uint32_t>(x1 - x0), static_cast<std::uint32_t>(y1 - y0)}};
++            }
 +            ++flat;
 +        }
 +
@@ -1051,7 +1095,7 @@ index ef4fcb8..ee5a488 100644
  // Draws the older frame into the slot's blend target with every matched
  // draw's transforms blended a fraction `t` towards the newer frame's. Draws
  // without a partner in the newer frame, and those never blended (2D, the
-@@ -8464,6 +9244,7 @@ void VulkanRenderer::Impl::reset_interpolation() {
+@@ -8464,6 +9288,7 @@ void VulkanRenderer::Impl::reset_interpolation() {
  void VulkanRenderer::Impl::destroy_interpolation_targets() {
      for (Target &picture : pictures) destroy_target(picture);
      for (Target &target : blend_targets) destroy_target(target);
@@ -1059,7 +1103,7 @@ index ef4fcb8..ee5a488 100644
      older_picture_valid = newer_picture_valid = false;
  }
  
-@@ -8646,8 +9427,14 @@ bool VulkanRenderer::present(std::uint32_t display_address,
+@@ -8646,8 +9471,14 @@ bool VulkanRenderer::present(std::uint32_t display_address,
          impl.poll_presents(std::chrono::steady_clock::now(), false, false);
          return false;
      }
@@ -1211,7 +1255,7 @@ index 0000000..d3b9d76
 +
 +} // namespace portablekit::gpu::xr
 diff --git a/host/platform/android_app.cpp b/host/platform/android_app.cpp
-index f5c6539..1bf2aed 100644
+index f5c6539..0eed6e2 100644
 --- a/host/platform/android_app.cpp
 +++ b/host/platform/android_app.cpp
 @@ -11,6 +11,9 @@
@@ -1224,6 +1268,15 @@ index f5c6539..1bf2aed 100644
  
  #include <cstdint>
  #include <cstdio>
+@@ -53,7 +56,7 @@ void redirect_output() {
+ // The APK carries the fallback font a release ships in fonts/, as an asset.
+ // The font code maps files, so it is unpacked to the app's storage once and
+ // found there.
+-constexpr const char *kBundledFonts[] = {"NotoSansCJKjp-Regular.otf"};
++constexpr const char *kBundledFonts[] = {"DejaVuSans.ttf", "NotoSansCJKjp-Regular.otf"};
+ 
+ void unpack_bundled_fonts() {
+     const char *storage = SDL_GetAndroidInternalStoragePath();
 @@ -85,10 +88,101 @@ void unpack_bundled_fonts() {
      portablekit::set_bundled_resource_directory(root);
  }

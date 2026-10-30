@@ -453,7 +453,7 @@ bool QuestXr::start(VkInstance instance, VkPhysicalDevice physical_device, VkDev
 }
 
 // Two swapchains at the runtime's recommended eye size, scaled by
-// PURE_VR_EYE_SCALE (default 0.8: the PSP's art gains little from more).
+// PURE_VR_EYE_SCALE (default 0.9: smoother edges than 0.8 at 60 fps; 1.1 made the GPU the bottleneck).
 bool QuestXr::create_eye_swapchains() {
     std::uint32_t count = 0;
     if (!ok(xrEnumerateViewConfigurationViews(instance_, system_, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0,
@@ -465,7 +465,7 @@ bool QuestXr::create_eye_swapchains() {
     for (XrViewConfigurationView &view : views) view.type = XR_TYPE_VIEW_CONFIGURATION_VIEW;
     xrEnumerateViewConfigurationViews(instance_, system_, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, count, &count,
                                       views.data());
-    float scale = 0.8f;
+    float scale = 0.9f;
     if (const char *text = std::getenv("PURE_VR_EYE_SCALE"); text != nullptr) {
         const float named = std::strtof(text, nullptr);
         if (named >= 0.3f && named <= 1.5f) scale = named;

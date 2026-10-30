@@ -514,4 +514,8 @@ edit(R, "        info.format = format;\n        info.extent = {width, height, 1u
      "        }\n"
      "        info.extent = {width, height, 1u};\n        info.mipLevels = mip_levels;\n")
 
+# The Quest APK carries DejaVu Sans for the port's menu (packaging/quest/fonts).
+edit(A, "constexpr const char *kBundledFonts[] = {\"NotoSansCJKjp-Regular.otf\"};\n",
+     "constexpr const char *kBundledFonts[] = {\"DejaVuSans.ttf\", \"NotoSansCJKjp-Regular.otf\"};\n")
+
 print("changed:", sorted(set(changed)) or "nothing (already applied)")
