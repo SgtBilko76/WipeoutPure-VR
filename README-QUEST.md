@@ -7,7 +7,7 @@ curved screen.
 
 - Races at 60 fps and full game speed on Meta Quest 3, shown at 120 Hz (every frame exactly twice, no judder)
 - Stereo 3D with head tracking: look into the corners and over the edge of the track; the HUD floats in front of you
-- Antialiasing: supersampled eyes plus 2x MSAA
+- Sharp: eye images at the headset's full recommended size, plus 2x MSAA
 - The HD texture pack by NR74W, downloaded by the app on the first start (nothing of it is in the APK)
 - Touch and PICO controllers, the menus also on the left stick
 - Shader pipelines for the whole game prepared in the background, so races do not stop to compile shaders
@@ -76,9 +76,10 @@ without a new build:
 
 | Line | Effect |
 |---|---|
-| `PURE_VR_EYE_SCALE=0.9` | eye image size, relative to the headset's recommendation (0.7 on XR2 Gen 1 headsets) |
+| `PURE_VR_EYE_SCALE=1.0` | eye image size, relative to the headset's recommendation (0.7 on XR2 Gen 1 headsets) |
 | `PURE_VR_MSAA=2` | antialiasing samples: 0 (off), 2 or 4 (0 on XR2 Gen 1 headsets) |
 | `PURE_VR_REFRESH=120` | display refresh in Hz, if the headset offers it (72 = the system default) |
+| `PURE_VR_RACE_FPS=72` | races at 72 fps on a 72 Hz display, with eyes at 0.8, no MSAA and a narrower race camera (on a Quest 3 full scenes can still slow the game a little) |
 | `PURE_VR_RACE_FPS=30` | races at the PSP's 30 fps, for headsets that can't hold 60 |
 | `PURE_VR_HUD_DISTANCE=2.0`, `PURE_VR_HUD_WIDTH=1.8` | where the HUD floats, in metres |
 | `PURE_VR_FOV=110` | how wide the game draws the track around you, in degrees |

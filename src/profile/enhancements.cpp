@@ -223,13 +223,13 @@ bool vr_thirty_fps() {
     return thirty;
 }
 
-// The default: races at the headset's refresh, 72 Hz (E8's display rate: the game at 71.64 Hz), one game frame per
-// headset frame. It needs about 13.9 ms a frame where 60 fps allows 16.7, so the 72-fps defaults draw less
-// (quest_xr.cpp, physical_device). PURE_VR_RACE_FPS=60 or 30 keeps the PSP's vblank (on a 120 Hz display). Not
-// cached: the XR bridge sets PURE_VR_RACE_FPS=60 on the XR2 Gen 1 headsets after the first call.
+// PURE_VR_RACE_FPS=72 (or display): races at the headset's refresh, 72 Hz (E8's display rate: the game at
+// 71.64 Hz), one game frame per headset frame, with lighter eyes (quest_xr.cpp, physical_device). It needs about
+// 13.9 ms a frame where 60 fps allows 16.7: on a Quest 3 at eye scale 1.0 a quarter of the race seconds fell to
+// 80-95 % speed, so the default stays the PSP's vblank (60 fps, shown at 120 Hz).
 bool vr_display_fps() {
     const char *v = env("VR_RACE_FPS");
-    return v == nullptr || (std::strcmp(v, "60") != 0 && std::strcmp(v, "30") != 0);
+    return v != nullptr && (std::strcmp(v, "72") == 0 || std::strcmp(v, "display") == 0);
 }
 
 void thirty_fps(psprecomp::GuestMemory &m) {

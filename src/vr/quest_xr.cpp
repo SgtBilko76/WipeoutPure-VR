@@ -352,9 +352,9 @@ VkPhysicalDevice QuestXr::physical_device(VkInstance instance) {
     VkPhysicalDevice device = VK_NULL_HANDLE;
     if (!ok(get_graphics_device_(instance_, system_, instance, &device), "xrGetVulkanGraphicsDeviceKHR"))
         return VK_NULL_HANDLE;
-    // Quest 3/3S and PICO 4 Ultra (XR2 Gen 2, Adreno 740) run the defaults: eyes at 0.9, 2x MSAA, 60-fps races at
-    // full speed. Quest 2/Pro and PICO 4 (XR2 Gen 1, Adreno 650) have about half the GPU: smaller eyes and no MSAA
-    // unless env.txt names them. Untested on those headsets.
+    // Quest 3/3S and PICO 4 Ultra (XR2 Gen 2, Adreno 740) run the defaults: 60-fps races on a 120 Hz display, eyes
+    // at the headset's recommended size (1.0), 2x MSAA, a 110 degree race camera. Quest 2/Pro and PICO 4 (XR2
+    // Gen 1, Adreno 650) have about half the GPU: smaller eyes and no MSAA unless env.txt names them. Untested there.
     VkPhysicalDeviceProperties properties{};
     vkGetPhysicalDeviceProperties(device, &properties);
     const char *adreno = std::strstr(properties.deviceName, "Adreno (TM) ");
@@ -365,11 +365,10 @@ VkPhysicalDevice QuestXr::physical_device(VkInstance instance) {
         setenv("PURE_VR_EYE_SCALE", "0.7", 0);
         setenv("PURE_VR_MSAA", "0", 0);
     }
-    // 72-fps races (the default; enhancements.cpp vr_display_fps) have 13.9 ms a frame: smaller eyes, a narrower
-    // race camera (fewer draw calls), no MSAA, the high clocks and a tighter performance-hint target. 60-fps races
-    // (PURE_VR_RACE_FPS=60) keep eyes at 0.9, 2x MSAA and a 110 degree camera, on a 120 Hz display.
+    // 72-fps races (PURE_VR_RACE_FPS=72; enhancements.cpp vr_display_fps) have 13.9 ms a frame: smaller eyes, a
+    // narrower race camera (fewer draw calls), no MSAA, the high clocks and a tighter performance-hint target.
     const char *race = std::getenv("PURE_VR_RACE_FPS");
-    const bool seventy_two = race == nullptr || (std::strcmp(race, "60") != 0 && std::strcmp(race, "30") != 0);
+    const bool seventy_two = race != nullptr && (std::strcmp(race, "72") == 0 || std::strcmp(race, "display") == 0);
     if (seventy_two) {
         setenv("PURE_VR_EYE_SCALE", "0.8", 0);
         setenv("PURE_VR_MSAA", "0", 0);
@@ -380,7 +379,7 @@ VkPhysicalDevice QuestXr::physical_device(VkInstance instance) {
     // A 60-fps race leaves 16.7 ms a frame: the hint asks for the clocks that finish the game's work in about 12.
     setenv("PURE_PERFORMANCE_HINT_MS", "12", 0);
     log("GPU %s: %s, races at %s fps", properties.deviceName, gen1 ? "XR2 Gen 1 (lighter defaults)" : "full defaults",
-        seventy_two ? "72" : race);
+        seventy_two ? "72" : race != nullptr && std::strcmp(race, "30") == 0 ? "30" : "60");
     return device;
 }
 
@@ -468,11 +467,11 @@ bool QuestXr::start(VkInstance instance, VkPhysicalDevice physical_device, VkDev
         std::string offered;
         for (float r : rates) offered += " " + std::to_string(static_cast<int>(std::lround(r)));
         log("display refresh rates offered:%s", offered.c_str());
-        // 72 Hz for 72-fps races, 120 Hz for 60 (each frame shown twice) and 30.
+        // 120 Hz for 60-fps races (each frame shown twice) and 30, 72 Hz for 72-fps races.
         const char *named = std::getenv("PURE_VR_REFRESH");
         const char *race = std::getenv("PURE_VR_RACE_FPS");
-        const bool console_rate = race != nullptr && (std::strcmp(race, "60") == 0 || std::strcmp(race, "30") == 0);
-        if (const char *text = named != nullptr ? named : console_rate ? "120" : "72"; text != nullptr) {
+        const bool seventy_two = race != nullptr && (std::strcmp(race, "72") == 0 || std::strcmp(race, "display") == 0);
+        if (const char *text = named != nullptr ? named : seventy_two ? "72" : "120"; text != nullptr) {
             const float wanted = std::strtof(text, nullptr);
             float best = 0.0f;
             for (float r : rates)
@@ -511,7 +510,8 @@ bool QuestXr::start(VkInstance instance, VkPhysicalDevice physical_device, VkDev
 }
 
 // Two swapchains at the runtime's recommended eye size, scaled by
-// PURE_VR_EYE_SCALE (default 0.9: smoother edges than 0.8 at 60 fps; 1.1 made the GPU the bottleneck).
+// PURE_VR_EYE_SCALE (default 1.0, the recommended size; physical_device sets 0.8 for 72-fps races and 0.7 on
+// XR2 Gen 1 headsets).
 bool QuestXr::create_eye_swapchains() {
     std::uint32_t count = 0;
     if (!ok(xrEnumerateViewConfigurationViews(instance_, system_, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0,
@@ -523,7 +523,7 @@ bool QuestXr::create_eye_swapchains() {
     for (XrViewConfigurationView &view : views) view.type = XR_TYPE_VIEW_CONFIGURATION_VIEW;
     xrEnumerateViewConfigurationViews(instance_, system_, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, count, &count,
                                       views.data());
-    float scale = 0.9f;
+    float scale = 1.0f;
     if (const char *text = std::getenv("PURE_VR_EYE_SCALE"); text != nullptr) {
         const float named = std::strtof(text, nullptr);
         if (named >= 0.3f && named <= 1.5f) scale = named;
