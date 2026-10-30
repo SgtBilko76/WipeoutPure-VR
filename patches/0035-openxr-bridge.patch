@@ -1548,7 +1548,7 @@ index 0000000..d3b9d76
 +
 +} // namespace portablekit::gpu::xr
 diff --git a/host/platform/android_app.cpp b/host/platform/android_app.cpp
-index f5c6539..ac5c345 100644
+index f5c6539..ed862ec 100644
 --- a/host/platform/android_app.cpp
 +++ b/host/platform/android_app.cpp
 @@ -11,6 +11,13 @@
@@ -1586,7 +1586,7 @@ index f5c6539..ac5c345 100644
  
  void unpack_bundled_fonts() {
      const char *storage = SDL_GetAndroidInternalStoragePath();
-@@ -85,10 +96,183 @@ void unpack_bundled_fonts() {
+@@ -85,10 +96,185 @@ void unpack_bundled_fonts() {
      portablekit::set_bundled_resource_directory(root);
  }
  
@@ -1693,8 +1693,10 @@ index f5c6539..ac5c345 100644
 +// The shader pipelines a release ships (assets/pipeline/, taken from a headset that has driven the game): the list
 +// of every pipeline seen, which the renderer builds in the background at start (the eyes' MSAA ones too), and the
 +// driver's cache of them, which a driver that does not match simply ignores. Copied once; from then on the files
-+// grow with the player's own races.
++// grow with the player's own races. `root` is the data directory (files/, or env.txt's PURE_DATA_DIR in a test).
 +void copy_bundled_pipelines(const std::filesystem::path &root) {
++    std::error_code made;
++    std::filesystem::create_directories(root, made);
 +    for (const char *name : {"pipeline_keys.bin", "pipeline_cache.bin"}) {
 +        const std::filesystem::path target = root / name;
 +        std::error_code ec;
@@ -1747,9 +1749,9 @@ index f5c6539..ac5c345 100644
 +            std::printf("[android] env.txt: %s\n", line.c_str());
 +        }
 +    }
-+    copy_bundled_pipelines(root);
 +    import_disc_image(root);
 +    setenv(portablekit::env_name("DATA_DIR").c_str(), root.c_str(), 0);
++    copy_bundled_pipelines(std::getenv(portablekit::env_name("DATA_DIR").c_str()));
 +    const std::filesystem::path game = root / "game";
 +    if (std::filesystem::is_regular_file(game / "disc.iso", ec) &&
 +        std::filesystem::is_regular_file(game / "EBOOT.ELF", ec))

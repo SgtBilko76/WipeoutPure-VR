@@ -57,8 +57,10 @@ void import_disc_image(const std::filesystem::path &root) {
 // The shader pipelines a release ships (assets/pipeline/, taken from a headset that has driven the game): the list
 // of every pipeline seen, which the renderer builds in the background at start (the eyes' MSAA ones too), and the
 // driver's cache of them, which a driver that does not match simply ignores. Copied once; from then on the files
-// grow with the player's own races.
+// grow with the player's own races. `root` is the data directory (files/, or env.txt's PURE_DATA_DIR in a test).
 void copy_bundled_pipelines(const std::filesystem::path &root) {
+    std::error_code made;
+    std::filesystem::create_directories(root, made);
     for (const char *name : {"pipeline_keys.bin", "pipeline_cache.bin"}) {
         const std::filesystem::path target = root / name;
         std::error_code ec;

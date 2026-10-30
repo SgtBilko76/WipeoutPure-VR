@@ -195,6 +195,8 @@ private:
     PFN_xrGetDisplayRefreshRateFB get_refresh_rate_{};
     PFN_xrEnumerateDisplayRefreshRatesFB enumerate_refresh_rates_{};
     PFN_xrRequestDisplayRefreshRateFB request_refresh_rate_{};
+    float wanted_refresh_{};  // the rate asked for (PURE_VR_REFRESH), asked again whenever the session restarts
+    void request_refresh();
 
     // Vulkan: the runtime's queue and the semaphores ordering the copies.
     VkDevice device_{VK_NULL_HANDLE};
@@ -455,8 +457,9 @@ bool QuestXr::start(VkInstance instance, VkPhysicalDevice physical_device, VkDev
             float best = 0.0f;
             for (float r : rates)
                 if (std::fabs(r - wanted) < 0.5f) best = r;
-            if (best > 0.0f) ok(request_refresh_rate_(session_, best), "xrRequestDisplayRefreshRateFB");
+            if (best > 0.0f) wanted_refresh_ = best;
             else log("PURE_VR_REFRESH=%s is not offered", text);
+            request_refresh();
         }
         float rate = 0.0f;
         if (XR_SUCCEEDED(get_refresh_rate_(session_, &rate)) && rate > 0.0f) refresh_.store(rate);
@@ -699,6 +702,16 @@ void QuestXr::read_input() {
     for (std::size_t i = 0; i < axes.size(); ++i) axes_[i].store(axes[i], std::memory_order_relaxed);
 }
 
+// The runtime falls back to its own rate when the session stops (the headset taken off, the Guardian dialog, the
+// system menu) and keeps it when the session runs again, so the wanted rate is asked for at every start.
+void QuestXr::request_refresh() {
+    if (!refresh_ext_ || wanted_refresh_ <= 0.0f) return;
+    float rate = 0.0f;
+    if (XR_SUCCEEDED(get_refresh_rate_(session_, &rate)) && std::fabs(rate - wanted_refresh_) < 0.5f) return;
+    if (ok(request_refresh_rate_(session_, wanted_refresh_), "xrRequestDisplayRefreshRateFB"))
+        log("display refresh %.0f Hz asked for", static_cast<double>(wanted_refresh_));
+}
+
 // The frame thread's.
 void QuestXr::poll_events() {
     XrEventDataBuffer event{XR_TYPE_EVENT_DATA_BUFFER};
@@ -713,6 +726,8 @@ void QuestXr::poll_events() {
                 begin.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
                 std::lock_guard lock(xr_mutex_);
                 running_.store(ok(xrBeginSession(session_, &begin), "xrBeginSession"));
+            } else if (state_ == XR_SESSION_STATE_FOCUSED) {
+                request_refresh();
             } else if (state_ == XR_SESSION_STATE_STOPPING) {
                 std::lock_guard lock(xr_mutex_);
                 running_.store(false);

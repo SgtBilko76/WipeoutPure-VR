@@ -27,7 +27,8 @@ import java.util.zip.ZipInputStream;
  * Runs once per process on a background thread and never stops the game: without a network it tries again at the
  * next start. A pack already installed (or copied there by hand) is left alone, and an empty file "no-hd-textures"
  * in the data folder turns the download off. Progress and problems go to hd-textures.txt in the data folder and to
- * the log (System.out, tag "System.out" in logcat).
+ * logcat (tag WipeoutPureVR). The data folder is the app's files/, or the folder env.txt's PURE_DATA_DIR names
+ * (a test switch the native side follows too, so a fresh install can be tried beside the real data).
  *
  * Plain Java apart from nothing: main() runs it on a PC (java HdTextures DIR) to test the download and the unpacking.
  */
@@ -45,10 +46,12 @@ public final class HdTextures implements Runnable {
     static final int ATTEMPTS = 3;
 
     private static boolean sStarted;
-    private final File mRoot;
+    private final File mFiles;
+    private File mRoot;
 
-    HdTextures(File root) {
-        mRoot = root;
+    HdTextures(File files) {
+        mFiles = files;
+        mRoot = files;
     }
 
     /** Starts the download on its own thread, once per process. */
@@ -76,14 +79,17 @@ public final class HdTextures implements Runnable {
     }
 
     private void work() throws IOException, InterruptedException {
-        Map<String, String> env = readEnv(new File(mRoot, "env.txt"));
-        // Test switch: everything goes to textures-test/ instead, beside an installed pack.
-        boolean test = "1".equals(env.get("PURE_HD_TEXTURES_TEST"));
-        if (!test && new File(mRoot, "no-hd-textures").exists()) {
+        Map<String, String> env = readEnv(new File(mFiles, "env.txt"));
+        String named = env.get("PURE_DATA_DIR");
+        if (named != null && !named.isEmpty()) {
+            mRoot = new File(named);
+            if (!mRoot.isDirectory() && !mRoot.mkdirs()) throw new IOException("cannot make " + mRoot);
+        }
+        if (new File(mRoot, "no-hd-textures").exists()) {
             say("off (no-hd-textures)");
             return;
         }
-        File textures = new File(mRoot, test ? "textures-test" : "textures");
+        File textures = new File(mRoot, "textures");
         File target = new File(textures, DISC_ID);
         if (new File(target, "textures.ini").isFile()) {
             say("installed in " + target);
@@ -216,8 +222,14 @@ public final class HdTextures implements Runnable {
         return env;
     }
 
+    /** To logcat through android.util.Log on the headset, to stdout on a PC (main). */
     private static void say(String line) {
-        System.out.println("[hd-textures] " + line);
+        try {
+            Class.forName("android.util.Log").getMethod("i", String.class, String.class)
+                    .invoke(null, "WipeoutPureVR", "[hd-textures] " + line);
+        } catch (ReflectiveOperationException e) {
+            System.out.println("[hd-textures] " + line);
+        }
     }
 
     /** The player-readable state, in hd-textures.txt, and the log. */
