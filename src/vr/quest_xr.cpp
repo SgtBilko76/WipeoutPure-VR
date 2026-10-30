@@ -377,6 +377,8 @@ VkPhysicalDevice QuestXr::physical_device(VkInstance instance) {
         setenv("PURE_VR_PERF_LEVEL", "boost", 0);
         setenv("PURE_PERFORMANCE_HINT_MS", "10", 0);
     }
+    // A 60-fps race leaves 16.7 ms a frame: the hint asks for the clocks that finish the game's work in about 12.
+    setenv("PURE_PERFORMANCE_HINT_MS", "12", 0);
     log("GPU %s: %s, races at %s fps", properties.deviceName, gen1 ? "XR2 Gen 1 (lighter defaults)" : "full defaults",
         seventy_two ? "72" : race);
     return device;
@@ -1073,10 +1075,9 @@ QuestXr &quest_xr() {
 
 // Registered when libmain.so loads, before the renderer starts.
 const bool kRegistered = [] {
+    // The performance hint's target is set with the other race defaults in physical_device (env.txt, read after this,
+    // comes first there).
     portablekit::gpu::xr::set_bridge(&quest_xr());
-    // A 60-fps race leaves 16.7 ms a frame: the performance hint asks for the clocks that finish the game's thread's
-    // work in about 12 (env.txt, read later, can set PURE_PERFORMANCE_HINT_MS=25 for 30-fps races).
-    setenv("PURE_PERFORMANCE_HINT_MS", "12", 0);
     return true;
 }();
 
