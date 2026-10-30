@@ -236,7 +236,13 @@ const GameProfile &game() {
 
         // The menu's game rows (patch 0016-menu-rows-by-capability, D-014): ad hoc play is not a feature of this port
         // yet, and there is no right-stick or mouse camera (the PSP has neither; the race camera is the game's own).
+#if defined(PURE_QUEST_VR)
+        // The Quest build plays ad hoc races through a server (the master server's address is its default:
+        // enhancements.cpp, vr_network_defaults).
+        .features = {.adhoc = true, .right_stick_camera = false, .mouse_camera = false},
+#else
         .features = {.adhoc = false, .right_stick_camera = false, .mouse_camera = false},
+#endif
 
         // The enhancements, each a row of the menu's Game section (patch 0019-game-option-rows; enhancements.cpp): E4,
         // the 30 fps modes row (D-017, task 072), game.sixty_fps, default 60 fps; E6, Flashes (D-016, task 070),

@@ -378,6 +378,28 @@ void wrap_draw_sync(HleRegistrar &hle) {
 
 std::span<const GameOption> options() { return kOptions; }
 
-void install(HleRegistrar &hle) { wrap_draw_sync(hle); }
+#if defined(PURE_QUEST_VR)
+// The Quest build's network defaults: the master server (a dedicated Linux machine running
+// tools/quest/adhoc_server) and ad hoc play on, written to settings.ini the first time, so the game's ad hoc races
+// work without typing an address in the headset. PURE_VR_MASTER_SERVER names another host (host or host:port).
+constexpr const char *kMasterServer = "217.154.211.69";
+
+void vr_network_defaults() {
+    settings::Settings &s = settings::current();
+    if (!s.adhoc_server.empty()) return;
+    const char *named = std::getenv("PURE_VR_MASTER_SERVER");
+    s.adhoc_server = named != nullptr && *named != '\0' ? named : kMasterServer;
+    s.adhoc = true;
+    settings::save();
+    std::cout << "[pure] VR: ad hoc play through the master server " << s.adhoc_server << "\n";
+}
+#endif
+
+void install(HleRegistrar &hle) {
+#if defined(PURE_QUEST_VR)
+    vr_network_defaults();
+#endif
+    wrap_draw_sync(hle);
+}
 
 } // namespace portablekit::enhancements
