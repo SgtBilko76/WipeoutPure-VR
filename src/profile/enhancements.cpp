@@ -223,14 +223,13 @@ bool vr_thirty_fps() {
     return thirty;
 }
 
-// PURE_VR_RACE_FPS=72 (or display): races at the headset's refresh (E8's display rate: 71.64 Hz at 72), the game
-// stepping one frame per headset frame. It needs about 13.9 ms a frame where 60 fps allows 16.7.
+// The default: races at the headset's refresh, 72 Hz (E8's display rate: the game at 71.64 Hz), one game frame per
+// headset frame. It needs about 13.9 ms a frame where 60 fps allows 16.7, so the 72-fps defaults draw less
+// (quest_xr.cpp, physical_device). PURE_VR_RACE_FPS=60 or 30 keeps the PSP's vblank (on a 120 Hz display). Not
+// cached: the XR bridge sets PURE_VR_RACE_FPS=60 on the XR2 Gen 1 headsets after the first call.
 bool vr_display_fps() {
-    static const bool display = [] {
-        const char *v = env("VR_RACE_FPS");
-        return v != nullptr && (std::strcmp(v, "72") == 0 || std::strcmp(v, "display") == 0);
-    }();
-    return display;
+    const char *v = env("VR_RACE_FPS");
+    return v == nullptr || (std::strcmp(v, "60") != 0 && std::strcmp(v, "30") != 0);
 }
 
 void thirty_fps(psprecomp::GuestMemory &m) {
@@ -356,7 +355,9 @@ void display_rate(const psprecomp::GuestMemory *m) {
 #if defined(PURE_QUEST_VR)
     // The headset keeps the PSP's vblank (races at 59.94, or 30 with PURE_VR_RACE_FPS=30) unless the races follow
     // its refresh (vr_display_fps); it turns the picture with the head at its own refresh between the game's frames.
-    if (!vr_display_fps()) hz = 0.0;
+    // Whatever the Display rate row says, and never above 72: the runtime can sit at 90 Hz for a moment (after the
+    // system menu) before the 72 Hz the bridge asks for are back.
+    hz = vr_display_fps() ? std::min(display_hz(), 72.0) : 0.0;
 #endif
     std::uint64_t period = kVBlankPeriodUs;
     std::uint64_t display_period = 0u;

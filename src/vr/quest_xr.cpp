@@ -359,11 +359,26 @@ VkPhysicalDevice QuestXr::physical_device(VkInstance instance) {
     vkGetPhysicalDeviceProperties(device, &properties);
     const char *adreno = std::strstr(properties.deviceName, "Adreno (TM) ");
     const int model = adreno != nullptr ? std::atoi(adreno + 12) : 0;
-    if (model > 0 && model < 700) {
+    const bool gen1 = model > 0 && model < 700;
+    if (gen1) {
+        setenv("PURE_VR_RACE_FPS", "60", 0);
         setenv("PURE_VR_EYE_SCALE", "0.7", 0);
         setenv("PURE_VR_MSAA", "0", 0);
     }
-    log("GPU %s: %s defaults", properties.deviceName, model > 0 && model < 700 ? "XR2 Gen 1 (lighter)" : "full");
+    // 72-fps races (the default; enhancements.cpp vr_display_fps) have 13.9 ms a frame: smaller eyes, a narrower
+    // race camera (fewer draw calls), no MSAA, the high clocks and a tighter performance-hint target. 60-fps races
+    // (PURE_VR_RACE_FPS=60) keep eyes at 0.9, 2x MSAA and a 110 degree camera, on a 120 Hz display.
+    const char *race = std::getenv("PURE_VR_RACE_FPS");
+    const bool seventy_two = race == nullptr || (std::strcmp(race, "60") != 0 && std::strcmp(race, "30") != 0);
+    if (seventy_two) {
+        setenv("PURE_VR_EYE_SCALE", "0.8", 0);
+        setenv("PURE_VR_MSAA", "0", 0);
+        setenv("PURE_VR_FOV", "90", 0);
+        setenv("PURE_VR_PERF_LEVEL", "boost", 0);
+        setenv("PURE_PERFORMANCE_HINT_MS", "10", 0);
+    }
+    log("GPU %s: %s, races at %s fps", properties.deviceName, gen1 ? "XR2 Gen 1 (lighter defaults)" : "full defaults",
+        seventy_two ? "72" : race);
     return device;
 }
 
@@ -451,8 +466,11 @@ bool QuestXr::start(VkInstance instance, VkPhysicalDevice physical_device, VkDev
         std::string offered;
         for (float r : rates) offered += " " + std::to_string(static_cast<int>(std::lround(r)));
         log("display refresh rates offered:%s", offered.c_str());
+        // 72 Hz for 72-fps races, 120 Hz for 60 (each frame shown twice) and 30.
         const char *named = std::getenv("PURE_VR_REFRESH");
-        if (const char *text = named != nullptr ? named : "120"; text != nullptr) {
+        const char *race = std::getenv("PURE_VR_RACE_FPS");
+        const bool console_rate = race != nullptr && (std::strcmp(race, "60") == 0 || std::strcmp(race, "30") == 0);
+        if (const char *text = named != nullptr ? named : console_rate ? "120" : "72"; text != nullptr) {
             const float wanted = std::strtof(text, nullptr);
             float best = 0.0f;
             for (float r : rates)
