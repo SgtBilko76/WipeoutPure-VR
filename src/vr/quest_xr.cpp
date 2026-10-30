@@ -428,8 +428,8 @@ bool QuestXr::start(VkInstance instance, VkPhysicalDevice physical_device, VkDev
     log("screen swapchain %ux%u, format %lld, %u images", kPanelWidth, kPanelHeight,
         static_cast<long long>(swapchain_format_), count);
     if (refresh_ext_) {
-        // The rates the headset offers, and the one PURE_VR_REFRESH asks for (72 by default, the system's): 120 shows
-        // each frame of a 60-fps race twice, evenly, where 72 repeats every fifth.
+        // The rates the headset offers, and the one PURE_VR_REFRESH asks for (120 by default: each frame of a 60-fps
+        // race shown twice, evenly, where 72 repeats every fifth; PURE_VR_REFRESH=72 keeps the system's).
         std::uint32_t count = 0;
         enumerate_refresh_rates_(session_, 0, &count, nullptr);
         std::vector<float> rates(count);
@@ -437,7 +437,8 @@ bool QuestXr::start(VkInstance instance, VkPhysicalDevice physical_device, VkDev
         std::string offered;
         for (float r : rates) offered += " " + std::to_string(static_cast<int>(std::lround(r)));
         log("display refresh rates offered:%s", offered.c_str());
-        if (const char *text = std::getenv("PURE_VR_REFRESH"); text != nullptr) {
+        const char *named = std::getenv("PURE_VR_REFRESH");
+        if (const char *text = named != nullptr ? named : "120"; text != nullptr) {
             const float wanted = std::strtof(text, nullptr);
             float best = 0.0f;
             for (float r : rates)

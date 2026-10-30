@@ -426,6 +426,8 @@ edit(R, "    void replay(VkCommandBuffer commands, std::uint32_t slot, float t);
      "    std::uint32_t msaa_new{}, msaa_from_prewarm{};\n"
      "    double msaa_new_ms{}, msaa_new_max_ms{};\n"
      "    void prewarm_msaa();\n"
+     "    bool create_eye_msaa_pass();\n"
+     "    std::vector<PipelineKey> msaa_keys;  // the last runs' keys (prewarm_pipelines), for prewarm_msaa\n"
      "    bool create_eye_msaa();\n"
      "    void destroy_eye_msaa();\n"
      "    VkPipeline msaa_pipeline(VkPipeline pipeline);\n"
@@ -548,6 +550,13 @@ edit(R, "    [[nodiscard]] VkPipeline create_pipeline(const PipelineKey &key) co
      "    [[nodiscard]] VkPipeline create_pipeline(const PipelineKey &key, bool msaa = false) const;\n")
 edit(R, "VkPipeline VulkanRenderer::Impl::create_pipeline(const PipelineKey &key) const {\n",
      "VkPipeline VulkanRenderer::Impl::create_pipeline(const PipelineKey &key, bool msaa) const {\n")
+# The last runs' keys kept for the MSAA prewarm, which starts with the renderer (in the menus, not the first race).
+edit(R, "\n    prewarm->thread = std::thread([this, keys = std::move(keys)] {\n",
+     "\n    msaa_keys = keys;  // the eyes' MSAA twins (stereo_replay.inc, prewarm_msaa)\n"
+     "    prewarm->thread = std::thread([this, keys = std::move(keys)] {\n")
+edit(R, "    impl.prewarm_pipelines();\n",
+     "    impl.prewarm_pipelines();\n"
+     "    if (impl.xr && impl.create_eye_msaa_pass()) impl.prewarm_msaa();\n")
 # The MSAA prewarm stops and joins with the other one.
 edit(R, "    impl.prewarm->stop = true;\n    if (impl.prewarm->thread.joinable()) impl.prewarm->thread.join();\n",
      "    impl.prewarm->stop = true;\n    if (impl.prewarm->thread.joinable()) impl.prewarm->thread.join();\n"

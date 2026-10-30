@@ -132,15 +132,17 @@ bool invert(const EyeMatrix &m, EyeMatrix &out) {
 // background for every key known when the pass is first built (prewarm_msaa), else from its key the first time it
 // is drawn; the pipeline cache keeps them for the next run.
 
-bool VulkanRenderer::Impl::create_eye_msaa() {
-    if (eye_msaa_pass != VK_NULL_HANDLE && eye_msaa[0].framebuffer != VK_NULL_HANDLE) return true;
+// The MSAA pass and its sample count, without images: made at the renderer's start, so the pipelines' twins can be
+// made in the background before the first race (prewarm_msaa).
+bool VulkanRenderer::Impl::create_eye_msaa_pass() {
+    if (eye_msaa_pass != VK_NULL_HANDLE) return true;
     static const VkSampleCountFlagBits wanted = [] {
         const char *text = portablekit::env("VR_MSAA");
         const int samples = text != nullptr ? std::atoi(text) : 2;  // 4x cost 3 ms of GPU: stutter at 60 fps
         return samples >= 4 ? VK_SAMPLE_COUNT_4_BIT : samples >= 2 ? VK_SAMPLE_COUNT_2_BIT : VK_SAMPLE_COUNT_1_BIT;
     }();
     if (wanted == VK_SAMPLE_COUNT_1_BIT) return false;
-    if (eye_msaa_pass == VK_NULL_HANDLE) {
+    {
         VkPhysicalDeviceProperties properties{};
         vkGetPhysicalDeviceProperties(physical_device, &properties);
         const VkSampleCountFlags counts =
@@ -200,6 +202,12 @@ bool VulkanRenderer::Impl::create_eye_msaa() {
             return false;
         }
     }
+    return true;
+}
+
+bool VulkanRenderer::Impl::create_eye_msaa() {
+    if (eye_msaa_pass != VK_NULL_HANDLE && eye_msaa[0].framebuffer != VK_NULL_HANDLE) return true;
+    if (!create_eye_msaa_pass()) return false;
     VkPhysicalDeviceMemoryProperties memory{};
     vkGetPhysicalDeviceMemoryProperties(physical_device, &memory);
     bool lazy_used = false;
@@ -266,17 +274,15 @@ bool VulkanRenderer::Impl::create_eye_msaa() {
     return true;
 }
 
-// The twins of the pipelines made this run (first: the race's), then of those the start-up prewarm made from the
-// last runs' list, on a thread of their own; msaa_pipeline takes them from there. PURE_NO_PIPELINE_PREWARM turns it
-// off with the other prewarm.
+// The twins of the pipelines made this run so far, then of the last runs' list (the start-up prewarm's keys), on a
+// thread of their own, started with the renderer; msaa_pipeline takes them from there. PURE_NO_PIPELINE_PREWARM
+// turns it off with the other prewarm.
 void VulkanRenderer::Impl::prewarm_msaa() {
     if (msaa_prewarm->thread.joinable() || portablekit::env("NO_PIPELINE_PREWARM") != nullptr) return;
     std::vector<PipelineKey> keys;
     for (const auto &[key, pipeline] : pipelines) keys.push_back(key);
-    {
-        std::lock_guard<std::mutex> guard(prewarm->lock);
-        for (const auto &[key, pipeline] : prewarm->made) keys.push_back(key);
-    }
+    keys.insert(keys.end(), msaa_keys.begin(), msaa_keys.end());
+    msaa_keys.clear();
     msaa_prewarm->thread = std::thread([this, keys = std::move(keys)] {
         const auto start = std::chrono::steady_clock::now();
         std::uint32_t made = 0u;
